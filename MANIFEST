@@ -5,7 +5,9 @@ README
 eg/README
 eg/anonymiser.pl
 eg/leet.pl
+eg/logger.pl
 eg/outline.pl
+eg/post.pl
 eg/proxy-auth.pl
 eg/proxy.pl
 eg/rainbow.pl
@@ -42,6 +44,8 @@ t/64lines.t
 t/64tags.t
 t/66htmlparser.t
 t/71rot13.t
+t/90diveintomark.t
 t/README
 t/Utils.pm
 t/test.html
+META.yml                                 Module meta-data (added by MakeMaker)

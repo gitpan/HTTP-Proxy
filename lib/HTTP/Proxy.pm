@@ -20,12 +20,12 @@ require Exporter;
 @EXPORT_OK = qw( NONE ERROR STATUS PROCESS CONNECT HEADERS FILTER ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = '0.11';
+$VERSION = '0.12';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
 
 # standard filters
-require HTTP::Proxy::HeaderFilter::standard;    # needs $VERSION
+use HTTP::Proxy::HeaderFilter::standard;
 
 # constants used for logging
 use constant ERROR   => -1;
@@ -106,6 +106,7 @@ sub new {
         port     => 8080,
         timeout  => 60,
         via      => hostname() . " (HTTP::Proxy/$VERSION)",
+        x_forwarded_for => 1,
         @_,
     };
 
@@ -137,6 +138,10 @@ The defined accessors are (in alphabetical order):
 =item agent
 
 The LWP::UserAgent object used internally to connect to remote sites.
+
+=item client_socket (read-only)
+
+The socket currently connected to the client. Mostly useful in filters.
 
 =item conn (read-only)
 
@@ -286,10 +291,15 @@ sub url {
     return $self->daemon->url;
 }
 
-=item via ($hostname (HTTP::Proxy/$VERSION))
+=item via
 
 The content of the Via: header. Setting it to an empty string will
-prevent its addition.
+prevent its addition. (default: $hostname (HTTP::Proxy/$VERSION))
+
+=item x_forwarded_for
+
+If set to a true value, the proxy will send the X-Forwarded-For header.
+(default: true)
 
 =back
 
@@ -298,7 +308,7 @@ prevent its addition.
 # normal accessors
 for my $attr (
     qw( agent chunk daemon host logfh maxchild maxconn maxserve port
-    request response hop_headers logmask via )
+    request response hop_headers logmask via x_forwarded_for )
   )
 {
     no strict 'refs';
@@ -311,7 +321,7 @@ for my $attr (
 }
 
 # read-only accessors
-for my $attr (qw( conn control_regex loop )) {
+for my $attr (qw( conn control_regex loop client_socket )) {
     no strict 'refs';
     *{"HTTP::Proxy::$attr"} = sub { return $_[0]->{$attr} }
 }
@@ -345,6 +355,7 @@ sub start {
 
             # single-process proxy (useful for debugging)
             if ( $self->maxchild == 0 ) {
+                $self->maxserve(1);    # do not block simultaneous connections
                 $self->log( PROCESS, "No fork allowed, serving the connection" );
                 $self->serve_connections($fh->accept);
                 $self->{conn}++;    # read-only attribute
@@ -481,6 +492,7 @@ sub _init_agent {
 sub serve_connections {
     my ( $self, $conn ) = @_;
     my $response;
+    $self->{client_socket} = $conn;  # read-only
 
     my ( $last, $served ) = ( 0, 0 );
     while ( my $req = $conn->get_request() ) {
@@ -523,7 +535,9 @@ sub serve_connections {
         $self->{headers}{request}->filter( $req->headers, $req );
 
         # FIXME I don't know how to get the LWP::Protocol objet...
+        # NOTE: the request is always received in one piece
         $self->{body}{request}->filter( $req->content_ref, $req, undef );
+        $self->{body}{request}->eod;    # end of data
         $self->log( HEADERS, "($$) Request:", $req->headers->as_string );
 
         # the header filters created a response,
@@ -587,6 +601,14 @@ sub serve_connections {
         }
 
         # what about X-Died and X-Content-Range?
+        if( my $died = $response->header('X-Died') ) {
+            $self->log( ERROR, "($$) ERROR:", $died );
+            $sent = 0;
+            $response = HTTP::Response->new( 500, "Proxy filter error" );
+            $response->content_type( "text/plain" );
+            $response->content($died);
+            $self->response($response);
+        }
 
       SEND:
 
@@ -866,16 +888,14 @@ sub push_filter {
         # compute the match sub as a closure
         # for $self, $mime, $method, $scheme, $host, $path
         my $match = sub {
-            if ( defined $mime ) {
-                return 0
-                  if $self->response->headers->header('Content-Type') !~
-                  $mime;
-            }
-            return 0 if $self->{request}->method !~ $method;
-            return 0 if $self->{request}->uri->scheme !~ $scheme;
-            return 0 if $self->{request}->uri->authority !~ $host;
-            return 0 if $self->{request}->uri->path !~ $path;
-            return 0 if ( $self->{request}->uri->query || '') !~ $query;
+            return 0
+              if ( defined $mime )
+              && ( $self->response->content_type || '' ) !~ $mime;
+            return 0 if ( $self->{request}->method || '' ) !~ $method;
+            return 0 if ( $self->{request}->uri->scheme    || '' ) !~ $scheme;
+            return 0 if ( $self->{request}->uri->authority || '' ) !~ $host;
+            return 0 if ( $self->{request}->uri->path      || '' ) !~ $path;
+            return 0 if ( $self->{request}->uri->query     || '' ) !~ $query;
             return 1;    # it's a match
         };
 
@@ -1074,7 +1094,10 @@ sub filter {
             $_->filter( $data, $message, $protocol, $self->{buffers}[ $i++ ] );
         }
     }
-    else { $_->filter(@_) for @{ $self->{current} }; }
+    else {
+        $_->filter(@_) for @{ $self->{current} };
+        $self->eod;
+    }
 }
 
 #
@@ -1093,8 +1116,15 @@ sub filter_last {
     }
 
     # clean up the mess for next time
-    $self->{buffers} = [];
-    $self->{current} = undef;
+    $self->eod;
+}
+
+#
+# END OF DATA cleanup method
+#
+sub eod {
+    $_[0]->{buffers} = [];
+    $_[0]->{current} = undef;
 }
 
 1;

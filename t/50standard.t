@@ -1,5 +1,5 @@
 use strict;
-use Test::More tests => 8;
+use Test::More tests => 12;
 use LWP::UserAgent;
 use HTTP::Proxy;
 use t::Utils;    # some helper functions for the server
@@ -15,7 +15,7 @@ $test->no_ending(1);
 my $server = server_start();
 
 # create and fork the proxy
-my $proxy = HTTP::Proxy->new( port => 0, maxconn => 4 );
+my $proxy = HTTP::Proxy->new( port => 0, maxconn => 5 );
 $proxy->init;    # required to access the url later
 $proxy->agent->no_proxy( URI->new( $server->url )->host );
 push @pids, fork_proxy($proxy);
@@ -25,9 +25,31 @@ my $pid = fork;
 die "Unable to fork web server" if not defined $pid;
 
 if ( $pid == 0 ) {
+    my $res = HTTP::Response->new(
+        200, 'OK',
+        HTTP::Headers->new( 'Content-Type' => 'text/plain' ),
+        "Here is some data."
+    );
 
     # let's return some files when asked for them
     server_next($server) for 1 .. 3;
+    server_next($server,
+        sub {
+            my $req = shift;
+            is( $req->header("X-Forwarded-For"), '127.0.0.1',
+                "The daemon got X-Forwarded-For" );
+            return $res;
+        }
+    );
+    server_next( $server, 
+        sub {
+            my $req = shift;
+            is( $req->header("X-Forwarded-For"), undef,
+                "The daemon didn't get X-Forwarded-For" );
+            return $res;
+        }
+    );
+
     exit 0;
 }
 
@@ -53,18 +75,18 @@ is( scalar @server, 1, "A single Server: header for GET request" );
 # for HEAD requests
 $req = HTTP::Request->new( HEAD => $server->url . "headers-head" );
 $res = $ua->simple_request($req);
-my @date = $res->headers->header('Date');
+@date = $res->headers->header('Date');
 is( scalar @date, 1, "A single Date: header for HEAD request" );
-my @server = $res->headers->header('Server');
+@server = $res->headers->header('Server');
 is( scalar @server, 1, "A single Server: header for HEAD request" );
 
 # for direct proxy responses
 $ua->proxy( file => $proxy->url );
 $req = HTTP::Request->new( GET => "file:///etc/passwd" );
 $res = $ua->simple_request($req);
-my @date = $res->headers->header('Date');
+@date = $res->headers->header('Date');
 is( scalar @date, 1, "A single Date: header for direct proxy response" );
-my @server = $res->headers->header('Server');
+@server = $res->headers->header('Server');
 is( scalar @server, 1, "A single Server: header for direct proxy response" );
 # check the Server: header
 like( $server[0], qr!HTTP::Proxy/\d+\.\d+!, "Correct server name for direct proxy response" );
@@ -92,6 +114,23 @@ is( scalar @client, 0, "No Client-* headers sent by the proxy" );
 
 # close the connection to the proxy
 close $sock or diag "close: $!";
+
+# X-Forwarded-For (test in the server)
+$req = HTTP::Request->new( HEAD => $server->url . "x-forwarded-for" );
+$res = $ua->simple_request($req);
+is( $res->header( 'X-Forwarded-For' ), undef, "No X-Forwarded-For sent back" );
+
+# yet another proxy
+$proxy = HTTP::Proxy->new( port => 0, maxconn => 1, x_forwarded_for => 0 );
+$proxy->init;    # required to access the url later
+$proxy->agent->no_proxy( URI->new( $server->url )->host );
+push @pids, fork_proxy($proxy);
+
+# X-Forwarded-For (test in the server)
+$ua->proxy( http => $proxy->url );
+$req = HTTP::Request->new( HEAD => $server->url . "x-forwarded-for" );
+$res = $ua->simple_request($req);
+is( $res->header( 'X-Forwarded-For' ), undef, "No X-Forwarded-For sent back" );
 
 # make sure both kids are dead
 wait for @pids;

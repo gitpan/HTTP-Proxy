@@ -18,7 +18,9 @@ my $proxy = HTTP::Proxy->new(
     maxchild => 0,
     maxconn  => 2,
 );
+
 $proxy->init;
+$proxy->agent->proxy( http => "" );
 $proxy->push_filter( response => $filter );
 my $url = $proxy->url;
 
@@ -48,9 +50,9 @@ my $response = $ua->request( HTTP::Request->new( GET => $server->url ) );
 is( $response->header( "X-Foo" ), "Bar", "Proxy applied the transformation" );
 
 # for HEAD requests
-my $ua = LWP::UserAgent->new();
+$ua = LWP::UserAgent->new();
 $ua->proxy( http => $url );
-my $response = $ua->request( HTTP::Request->new( HEAD => $server->url ) );
+$response = $ua->request( HTTP::Request->new( HEAD => $server->url ) );
 is( $response->header( "X-Foo" ), "Bar", "Proxy applied the transformation" );
 
 # wait for kids
