@@ -11,7 +11,9 @@ use Carp;
 use strict;
 use vars qw( $VERSION $AUTOLOAD );
 
-$VERSION = 0.03;
+$VERSION = 0.04;
+
+my $CRLF = "\015\012";    # "\r\n" is not portable
 
 =pod
 
@@ -262,9 +264,7 @@ sub start {
 
             # the child process handles the whole connection
             else {
-                my $conn = $daemon->accept;
-                $SIG{INT} = 'IGNORE';
-                $self->process($conn);
+                $self->serve_connections($daemon);
                 exit;    # let's die!
             }
         }
@@ -314,8 +314,7 @@ sub init {
 
     # specific agent config
     $self->agent->requests_redirectable( [] );
-    $self->agent->protocols_forbidden(
-        [ @{ $self->agent->protocols_forbidden || [] }, 'mailto', 'file' ] );
+    $self->agent->protocols_allowed(     [qw( http https ftp gopher )] );
     return;
 }
 
@@ -326,7 +325,6 @@ sub init {
 sub _init_daemon {
     my $self = shift;
     my %args = (
-        LocalHost => $self->host,
         LocalPort => $self->port,
         ReuseAddr => 1,
     );
@@ -355,37 +353,52 @@ sub _init_agent {
 
 =cut
 
-sub process {
-    my ( $self, $conn ) = @_;
+sub serve_connections {
+    my ( $self, $daemon ) = @_;
     my $response;
+
+    my $conn = $daemon->accept;
+    $SIG{INT} = 'IGNORE';    # don't interrupt while we talk to a client
     my $req = $conn->get_request();
 
     unless ( defined $req ) {
         $self->log( 0, "Getting request failed:", $conn->reason );
     }
+    $self->log( 1, "($$) Request:", $req->uri );
 
     # can we serve this protocol?
     if ( !$self->agent->is_protocol_supported( my $s = $req->uri->scheme ) ) {
         $response = new HTTP::Response( 501, 'Not Implemented' );
         $response->content(
             "Scheme $s is not supported by the proxy's LWP::UserAgent");
-        goto SEND; # yuck :-)
+        goto SEND;    # yuck :-)
     }
 
     # massage the request to pop a response
-    $req->headers->remove_header('Proxy-Connection'); # broken header
-    $self->log( 1, "($$) Request:", $req->uri );
+    $req->headers->remove_header('Proxy-Connection');    # broken header
     $self->log( 5, "($$) Request:", $req->headers->as_string );
     $response = $self->agent->simple_request($req);
 
-    SEND:
+  SEND:
+
     # remove Connection: headers from the response
-    $response->headers->header(Connection => 'close' );
+    $response->headers->header( Connection => 'close' );
 
     # send the response
-    $conn->print( $response->as_string );
+    if ( $req->uri->scheme =~ /^(?:ftp|gopher)$/ && $response->is_success ) {
+        $conn->print( $response->content );
+    }
+    else {
+        $conn->print( $HTTP::Daemon::PROTO, ' ', $response->status_line, $CRLF,
+            $response->headers->as_string($CRLF), $CRLF );
+        if ( !$response->content && !$response->is_success ) {
+            $response->content( $response->error_as_HTML );
+        }
+        $conn->print( $response->content );
+    }
     $self->log( 1, "($$) Response:", $response->status_line );
     $self->log( 5, "($$) Response:", $response->headers->as_string );
+    $SIG{INT} = 'DEFAULT';
 }
 
 =item log( $level, $message )
