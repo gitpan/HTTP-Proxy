@@ -5,7 +5,6 @@ use LWP::UserAgent;
 use LWP::ConnCache;
 use Fcntl ':flock';         # import LOCK_* constants
 use POSIX ":sys_wait_h";    # WNOHANG
-use Sys::Hostname;
 use IO::Select;
 use Carp;
 
@@ -19,9 +18,12 @@ require Exporter;
 @EXPORT_OK = qw( NONE ERROR STATUS PROCESS CONNECT HEADERS FILTER ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = 0.09;
+$VERSION = '0.10';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
+
+# standard filters
+require HTTP::Proxy::HeaderFilter::standard;    # needs $VERSION
 
 # constants used for logging
 use constant ERROR   => -1;
@@ -78,6 +80,9 @@ filter the HTTP requests and responses through user-defined filters.
 =head1 METHODS
 
 =head2 Constructor
+
+The new() method creates a HTTP::Proxy object. All attributes can
+be passed as a parameter to replace the default.
 
 =cut
 
@@ -163,6 +168,13 @@ The HTTP::Daemon object used to accept incoming connections.
 =item host
 
 The proxy HTTP::Daemon host (default: 'localhost').
+
+This means that by default, the proxy answers only to clients on the
+local machine. You can pass a specific interface address or C<"">/C<undef>
+for any interface.
+
+This default prevents your proxy to be used as an anonymous proxy
+by script kiddies.
 
 =item logfh
 
@@ -270,7 +282,8 @@ This method works like Tk's C<MainLoop>: you hand over control to the
 HTTP::Proxy object you created and configured.
 
 If C<maxconn> is not zero, start() will return after accepting
-at most that many connections.
+at most that many connections. It will return the total number of
+connexions.
 
 =cut
 
@@ -368,11 +381,14 @@ sub init {
     # standard header filters
     $self->{headers}{request}  = HTTP::Proxy::FilterStack->new;
     $self->{headers}{response} = HTTP::Proxy::FilterStack->new;
-    $self->{headers}{request}->push(  [ sub { 1 }, \&_proxy_headers_filter ] );
-    $self->{headers}{response}->push( [ sub { 1 }, \&_proxy_headers_filter ] );
+
+    # the same standard filter is used to handle headers
+    my $std = HTTP::Proxy::HeaderFilter::standard->new();
+    $self->{headers}{request}->push(  [ sub { 1 }, $std ] );
+    $self->{headers}{response}->push( [ sub { 1 }, $std ] );
 
     # standard body filters
-    $self->{body}{request}  = HTTP::Proxy::FilterStack->new;
+    $self->{body}{request}  = HTTP::Proxy::FilterStack->new(1);
     $self->{body}{response} = HTTP::Proxy::FilterStack->new(1);
 
     return;
@@ -385,6 +401,7 @@ sub init {
 sub _init_daemon {
     my $self = shift;
     my %args = (
+        LocalAddr => $self->host,
         LocalPort => $self->port,
         ReuseAddr => 1,
     );
@@ -464,6 +481,7 @@ sub serve_connections {
                     $self->response($response);
                     $self->{headers}{response}
                       ->filter( $response->headers, $response );
+                    $response->remove_header("Content-Length");
 
                     # this is adapted from HTTP::Daemon
                     if ( $conn->antique_client ) { $last++ }
@@ -489,7 +507,6 @@ sub serve_connections {
                                 $response->push_header(
                                     "Connection" => "close" )
                                     if $served >= $self->maxserve;
-                                
                             }
                             else {
                                 $last++;
@@ -507,7 +524,8 @@ sub serve_connections {
                     "got " . length($data) . " bytes of body data" );
                 $self->{body}{response}->filter( \$data, $response, $proto );
                 if ($chunked) {
-                    printf $conn "%x%s%s%s", length($data), $CRLF, $data, $CRLF;
+                    printf $conn "%x%s%s%s", length($data), $CRLF, $data, $CRLF
+                      if length($data);    # the filter may leave nothing
                 }
                 else {
                     print $conn $data;
@@ -515,6 +533,9 @@ sub serve_connections {
             },
             $self->chunk
         );
+
+        # remove the header added by LWP::UA before it sends the response back
+        $response->remove_header('Client-Date');
 
         # do a last pass, in case there was something left in the buffers
         my $data = "";    # FIXME $protocol is undef here too
@@ -536,6 +557,7 @@ sub serve_connections {
       SEND:
 
         # responses that weren't filtered through callbacks
+        # FIXME make sure there is no content to filter
         if ( !$sent ) {
             $self->response($response);
             $self->{headers}{response}->filter( $response->headers, $response );
@@ -573,21 +595,28 @@ filter chains: C<request-headers>, C<request-body>, C<reponse-headers> and
 C<response-body>.
 
 You can add your own filters to the default ones with the
-push_header_filter() and the push_body_filter() methods. Both methods
-work more or less the same way: they push a header filter on the
-corresponding filter stack.
+push_filter() method. The method push a filter on the appropriate
+filter stack.
 
-    $proxy->push_body_filter( response => $coderef );
+    $proxy->push_filter( response => $filter );
 
-The name of the method called gives the headers/body part while the
-named parameter give the request/response part.
+The headers/body category is determined by the type of the filter.
+There are two base classes for filters, which are
+HTTP::Proxy::HeaderFilter and HTTP::Proxy::BodyFilter (the names
+are self-explanatory). See the documentation of those two classes
+to find out how to write your own header or body filters.
 
-It is possible to push the same coderef on the request and response
+The named parameter is used to determine the request/response part.
+
+It is possible to push the same filter on the request and response
 stacks, as in the following example:
 
-    $proxy->push_header_filter( request => $coderef, response => $coderef );
+    $proxy->push_filter( request => $filter, response => $filter );
 
-Named parameters can be added. They are:
+If several filters match the message, they will be applied in the order
+they were pushed on their filter stack.
+
+Named parameters can be used to create the match routine. They are: 
 
     mime   - the MIME type (for a response-body filter)
     method - the request method
@@ -620,62 +649,59 @@ expressions.
 A match routine is compiled by the proxy and used to check if a particular
 request or response must be filtered through a particular filter.
 
-The signature for the "headers" filters is:
+It is also possible to push several filters on the same stack with
+the same match subroutine:
 
-    sub header_filter { my ( $headers, $message) = @_; ... }
+    # convert italics to bold
+    $proxy->push_filter(
+        mime     => 'text/html',
+        response => HTTP::Proxy::BodyFilter::tags->new(),
+        response =>
+        HTTP::Proxy::BodyFilter::simple->new( sub { s!(</?)i>!$1b>!ig } )
+    );
 
-where $header is a HTTP::Headers object, and $message is either a
-HTTP::Request or a HTTP::Response object.
+For more details regarding the creation of new filters, check the
+HTTP::Proxy::HeaderFilter and HTTP::Proxy::BodyFilter documentation.
 
-The signature for the "body" filters is:
-
-    sub body_filter { my ( $dataref, $message, $protocol ) = @_; ... }
-
-$dataref is a reference to the chunk of data received.
-
-Note that this subroutine signature looks a lot like that of the callbacks
-of LWP::UserAgent (except that $message is either a HTTP::Request or a
-HTTP::Response object).
-
-Here are a few example filters:
+Here's an example of subclassing a base filter class:
 
     # fixes a common typo ;-)
     # but chances are that this will modify a correct URL
-    $proxy->push_body_filter( response => sub { ${$_[0]} =~ s/PERL/Perl/g } );
+    {
+        package FilterPerl;
+        use base qw( HTTP::Proxy::BodyFilter );
 
-    # mess up trace requests
-    $proxy->push_headers_filter(
-        method   => 'TRACE',
-        response => sub {
-            my $headers = shift;
-            $headers->header( X_Trace => "Something's wrong!" );
-        },
-    );
+        sub filter {
+	    my ( $self, $dataref, $message, $protocol, $buffer ) = @_;
+            $$dataref =~ s/PERL/Perl/g;
+        }
+    }
+    $proxy->push_filter( response => FilterPerl->new() );
+
+Other examples can be found in the documentation for
+HTTP::Proxy::HeaderFilter, HTTP::Proxy::BodyFilter,
+HTTP::Proxy::HeaderFilter::simple, HTTP::Proxy::BodyFilter::simple.
 
     # a simple anonymiser
-    $proxy->push_headers_filter(
+    # see eg/anonymiser.pl for the complete code
+    $proxy->push_filter(
         mime    => undef,
-        request => sub {
-            $_[0]->remove_header(qw( User-Agent From Referer Cookie ));
-        },
-        response => sub {
-            $_[0]->revome_header(qw( Set-Cookie )),;
-        },
+        request => HTTP::Proxy::HeaderFilter::simple->new(
+            sub { $_[0]->remove_header(qw( User-Agent From Referer Cookie )) },
+        ),
+        response => HTTP::Proxy::HeaderFilter::simple->new(
+            sub { $_[0]->revome_header(qw( Set-Cookie )); },
+        )
     );
 
 IMPORTANT: If you use your own LWP::UserAgent, you must install it
-before your calls to push_headers_filter() or push_body_filter(), or
+before your calls to push_filter(), otherwise
 the match method will make wrong assumptions about the schemes your
 agent supports.
 
-=over 4
-
 =cut
 
-# internal method
-# please use push_headers_filters() and push_body_filter()
-
-sub _push_filter {
+sub push_filter {
     my $self = shift;
     my %arg  = (
         mime   => 'text/*',
@@ -683,16 +709,15 @@ sub _push_filter {
         scheme => 'http',
         host   => '',
         path   => '',
-        @_
     );
 
-    # argument checking
-    croak "No filter type defined" if ( !exists $arg{part} );
-    croak "Bad filter queue: $arg{part}"
-      if ( $arg{part} !~ /^(?:headers|body)$/ );
-    if ( !exists $arg{request} && !exists $arg{response} ) {
-        croak "No message type defined for filter";
+    # parse parameters
+    for( my $i = 0; $i < @_ ; $i += 2 ) {
+        next if $_[$i] !~ /^(mime|method|scheme|host|path)$/;
+        $arg{$_[$i]} = $_[$i+1];
+        splice @_, $i, 2;
     }
+    croak "Odd number of arguments" if @_ % 2;
 
     # the proxy must be initialised
     $self->init;
@@ -714,7 +739,8 @@ sub _push_filter {
 
     my @scheme = split /\s*,\s*/, $scheme;
     for (@scheme) {
-        croak "Unsupported scheme" if !$self->agent->is_protocol_supported($_);
+        croak "Unsupported scheme: $_"
+          if !$self->agent->is_protocol_supported($_);
     }
     $scheme = @scheme ? '(?:' . join ( '|', @scheme ) . ')' : '';
     $scheme = qr/$scheme/;
@@ -723,9 +749,19 @@ sub _push_filter {
     $path ||= '.*';
 
     # push the filter and its match method on the correct stack
-    for my $message ( grep { exists $arg{$_} } qw( request response ) ) {
-        croak "Not a CODE reference for filter queue $message"
-          if ref $arg{$message} ne 'CODE';
+    while(@_) {
+        my ($message, $filter ) = (shift, shift);
+        croak "'$message' is not a filter stack"
+          unless $message =~ /^(request|response)$/;
+        
+        croak "Not a Filter reference for filter queue $message"
+          unless ref( $filter )
+          && ( $filter->isa('HTTP::Proxy::HeaderFilter')
+            || $filter->isa('HTTP::Proxy::BodyFilter') );
+
+        my $stack;
+        $stack = 'headers' if $filter->isa('HTTP::Proxy::HeaderFilter');
+        $stack = 'body'    if $filter->isa('HTTP::Proxy::BodyFilter');
 
         # MIME can only match on reponse
         my $mime = $mime;
@@ -747,56 +783,11 @@ sub _push_filter {
         };
 
         # push it on the corresponding FilterStack
-        $self->{ $arg{part} }{$message}->push( [ $match, $arg{$message} ] );
+        $self->{$stack}{$message}->push( [ $match, $filter ] );
     }
 }
 
-=item push_headers_filter( type => coderef, %args )
-
-=cut
-
-sub push_headers_filter { _push_filter( @_, part => 'headers' ); }
-
-=item push_body_filter( type => coderef, %args )
-
-=cut
-
-sub push_body_filter { _push_filter( @_, part => 'body' ); }
-
-# standard proxy header filter (RFC 2616)
-sub _proxy_headers_filter {
-    my ( $headers, $message ) = @_;
-
-    # the Via: header
-    my $via = $message->protocol() || '';
-    if ( $via =~ s!HTTP/!! ) {
-        $via .= " " . hostname() . " (HTTP::Proxy/$VERSION)";
-        $message->headers->header(
-            Via => join ', ',
-            $message->headers->header('Via') || (), $via
-        );
-    }
-
-    # remove some headers
-    for (
-
-        # LWP::UserAgent Client-* headers
-        qw( Client-Aborted Client-Bad-Header-Line Client-Date Client-Junk
-        Client-Peer Client-Request-Num Client-Response-Num
-        Client-SSL-Cert-Issuer Client-SSL-Cert-Subject Client-SSL-Cipher
-        Client-SSL-Warning Client-Transfer-Encoding Client-Warning ),
-
-        # hop-by-hop headers (for now)
-        qw( Connection Keep-Alive TE Trailers Transfer-Encoding Upgrade
-        Proxy-Connection Proxy-Authenticate Proxy-Authorization Public ),
-
-        # no encoding accepted (gzip, compress, deflate)
-        qw( Accept-Encoding ),
-      )
-    {
-        $message->headers->remove_header($_);
-    }
-}
+=over 4
 
 =item log( $level, $prefix, $message )
 
@@ -843,10 +834,14 @@ This does not work under Windows, but I can't see why, and do not have
 a development platform under that system. Patches and explanations
 very welcome.
 
-The Date: header is duplicated.
+David Fishburn says:
 
-This is still beta software, expect some interfaces to change as
-I receive feedback from users.
+=over 4
+
+This did not work for me under WinXP - ActiveState Perl 5.6, but it DOES        
+work on WinXP ActiveState Perl 5.8. 
+
+=back
 
 =head1 AUTHOR
 
@@ -876,13 +871,19 @@ the same terms as Perl itself.
 # This is an internal class to work more easily with filter stacks
 #
 # Here's a description of the class internals
-# - filters: the actual filter stack
-# - current: the list of filters that match the message, and trhough which
-#            it must go (computed at the first call to filter())
+# - filters: the list of (sub, filter) pairs that match the message,
+#            and through which it must go
+# - current: the actual list of filters, which is computed during
+#            the first call to filter()
 # - buffers: the buffers associated with each (selected) filter
-# - body   : true if it's a message-body filter stack
+# - body   : true if it's a HTTP::Proxy::BodyFilter stack
 #
+# a filter is actually a (matchsub, filterobj) pair
+# the matchsub is run againt the HTTP::Message object to find out if
+# the filter must be applied to it
 package HTTP::Proxy::FilterStack;
+
+use Carp;
 
 #
 # new( $isbody )
@@ -895,14 +896,17 @@ sub new {
         buffers => [],
         current => undef,
     };
+    $self->{type} = $self->{body} ? "HTTP::Proxy::BodyFilter"
+                                  : "HTTP::Proxy::HeaderFilter";
     return bless $self, $class;
 }
 
 #
-# insert( $index, $matchsub, $filtersub )
+# insert( $index, [ $matchsub, $filter ], ...)
 #
 sub insert {
     my ( $self, $idx ) = ( shift, shift );
+    $_->[1]->isa( $self->{type} ) or croak("$_ is not a $self->{type}") for @_;
     splice @{ $self->{filters} }, $idx, 0, @_;
 }
 
@@ -914,11 +918,17 @@ sub remove {
     splice @{ $self->{filters} }, $idx, 1;
 }
 
-# some simple stuff
+# 
+# push( [ $matchsub, $filter ], ... )
+# 
 sub push {
     my $self = shift;
+    $_->[1]->isa( $self->{type} ) or croak("$_ is not a $self->{type}") for @_;
     push @{ $self->{filters} }, @_;
 }
+
+sub all    { return @{ $_[0]->{filters} }; }
+sub active { return @{ $_[0]->{current} }; }
 
 #
 # the actual filtering is done here
@@ -935,9 +945,12 @@ sub filter {
 
         # create the buffers
         if ( $self->{body} ) {
-            CORE::push @{ $self->{buffers} },
-              eval q(\"") for @{ $self->{current} };
+            $self->{buffers} = [ ( "" ) x @{ $self->{current} } ];
+            $self->{buffers} = [ \( @{ $self->{buffers} } ) ];
         }
+
+        # start the filter if needed
+        for ( @{ $self->{current} } ) { $_->start if $_->can('start'); }
     }
 
     # pass the body data through the filter
@@ -946,10 +959,11 @@ sub filter {
         my ( $data, $message, $protocol ) = @_;
         for ( @{ $self->{current} } ) {
             $$data = ${ $self->{buffers}[$i] } . $$data;
-            $_->( $data, $message, $protocol, $self->{buffers}[ $i++ ] );
+            ${ $self->{buffers}[ $i ] } = "";
+            $_->filter( $data, $message, $protocol, $self->{buffers}[ $i++ ] );
         }
     }
-    else { $_->(@_) for @{ $self->{current} }; }
+    else { $_->filter(@_) for @{ $self->{current} }; }
 }
 
 #
@@ -962,8 +976,9 @@ sub filter_last {
     my $i = 0;
     my ( $data, $message, $protocol ) = @_;
     for ( @{ $self->{current} } ) {
-        $$data = ${ $self->{buffers}[ $i++ ] } . $$data;
-        $_->( $data, $message, $protocol, undef );
+        $$data = ${ $self->{buffers}[ $i ] } . $$data;
+        ${ $self->{buffers}[ $i++ ] } = "";
+        $_->filter( $data, $message, $protocol, undef );
     }
 
     # clean up the mess for next time

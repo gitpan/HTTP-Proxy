@@ -4,6 +4,9 @@ use LWP::UserAgent;
 use HTTP::Proxy;
 use t::Utils;    # some helper functions for the server
 
+# this test was t/21headers.t before the test API was fully designed
+# this is the reason why it uses a complete client-proxy-server chain
+
 my $test = Test::Builder->new;
 my @pids;
 
@@ -69,6 +72,9 @@ my @date = $res->headers->header('Date');
 is( scalar @date, 1, "A single Date: header" );
 my @server = $res->headers->header('Server');
 is( scalar @server, 1, "A single Server: header" );
+
+# we cannot check that the LWP Client-* headers are removed
+# since we're using a LWP::UA to talk to the proxy
 
 # make sure both kids are dead
 wait for @pids;
