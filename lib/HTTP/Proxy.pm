@@ -3,13 +3,15 @@ package HTTP::Proxy;
 use HTTP::Daemon;
 use LWP::UserAgent;
 use LWP::ConnCache;
+use CGI;
 use Fcntl ':flock';    # import LOCK_* constants
+use POSIX;
 use Carp;
 
 use strict;
 use vars qw( $VERSION $AUTOLOAD );
 
-$VERSION = 0.02;
+$VERSION = 0.03;
 
 =pod
 
@@ -27,7 +29,7 @@ HTTP::Proxy - A pure Perl HTTP proxy
     # alternate initialisation
     my $proxy = HTTP::Proxy->new;
     $proxy->port( 3128 ); # the classical accessors are here!
-    
+
     # you can also use your own UserAgent
     my $agent = LWP::RobotUA->new;
     $proxy->agent( $agent );
@@ -52,9 +54,10 @@ sub new {
     # some defaults
     my $self = {
         agent    => undef,
+        control  => 'proxy',
         daemon   => undef,
         host     => 'localhost',
-        maxchild => 16,
+        maxchild => 10,
         maxconn  => 0,
         logfh    => *STDERR,
         port     => 8080,
@@ -63,9 +66,21 @@ sub new {
     };
 
     # non modifiable defaults
-    %$self = ( %$self, conn => 0 );
-    return bless $self, $class;
+    %$self = ( %$self, conn => 0, loop => 1 );
+    bless $self, $class;
+
+    # ugly way to set control_regex
+    $self->control( $self->control );
+
+    return $self;
 }
+
+# AUTOLOADed attributes
+my $all_attr = qr/^(?:agent|conn|control_regex|daemon|host|logfh|loop|
+                      maxchild|maxconn|port|verbose)$/x;
+
+# read-only attributes
+my $ro_attr = qr/^(?:conn|control_regex|loop)$/;
 
 =head2 Accessors
 
@@ -85,6 +100,31 @@ The defined accessors are (in alphabetical order):
 =item agent
 
 The LWP::UserAgent object used internally to connect to remote sites.
+
+=item conn (read-only)
+
+The number of connections processed by this HTTP::Proxy instance.
+
+=item control
+
+The default hostname for controlling the proxy (see L<CONTROL>).
+The default is "C<proxy>", which corresponds to the URL
+http://proxy/, where port is the listening port of the proxy).
+
+=cut
+
+sub control {
+    my $self = shift;
+    my $old  = $self->{control};
+    if (@_) {
+        my $control = shift;
+        $self->{control}       = $control;
+        $self->{control_regex} = qr!^http://$control(?:/(\w+))?!;
+    }
+    return $old;
+}
+
+# control_regex is private
 
 =item daemon
 
@@ -113,13 +153,32 @@ from start(). 0 (the default) means never stop accepting connections.
 
 The proxy HTTP::Daemon port (default: 8080).
 
-=item conn (read-only)
+=item url (read-only)
 
-The number of connections processed by this HTTP::Proxy instance.
+The url where the proxy can be reached.
+
+=cut
+
+sub url {
+    my $self = shift;
+    if ( not defined $self->daemon ) {
+        carp "HTTP daemon not started yet";
+        return undef;
+    }
+    return $self->daemon->url;
+}
 
 =item verbose
 
 Be verbose in the logs (default: 0).
+
+Here are the various log levels:
+ 0 - All errors
+ 1 - Requested URL, reponse status and total number of connections processed
+ 2 -
+ 3 - Subprocesses information (fork, wait, etc.)
+ 4 -
+ 5 - Full request and response headers are sent along
 
 =back
 
@@ -135,13 +194,10 @@ sub AUTOLOAD {
     my $attr = $1;
 
     # must be one of the registered subs
-    if ( $attr =~ /^(?:agent|daemon|host|maxconn|maxchild
-                      |logfh|port|conn|verbose)$/x
-      )
-    {
+    if ( $attr =~ $all_attr ) {
         no strict 'refs';
         my $rw = 1;
-        $rw = 0 if $attr =~ /^(?:conn)$/;
+        $rw = 0 if $attr =~ $ro_attr;
 
         # create and register the method
         *{$AUTOLOAD} = sub {
@@ -173,48 +229,93 @@ sub start {
 
     my @kids;
     my $reap;
-    $SIG{CHLD} = sub { $reap++ };
+    my $hupped;
+
+    # zombies reaper
+    my $reaper;
+    $reaper = sub {
+        $reap++;
+        $SIG{CHLD} = $reaper;    # for sysV systems
+    };
+    $SIG{CHLD} = $reaper;
+    $SIG{HUP}  = sub { $hupped++ };
+
+    # the main loop
     my $daemon = $self->daemon;
-    while ( my $conn = $daemon->accept ) {
-        my $child = fork;
-        if ( !defined $child ) {
+    while ( $self->loop ) {
 
-            # This could use a Retry-After: header...
-            $conn->send_error( 503, "Proxy cannot fork" );
-            $self->log( 0,          "Cannot fork" );
-            next;
-        }
-        if ($child) {    # the parent process
-            $self->{conn}++;    # Cannot use the interface for RO attributes
-            $self->log( 3, "Forked child process $child" );
-            push @kids, $child;
+        # prefork children process
+        for ( 1 .. $self->maxchild - @kids ) {
 
-            # wait if there are more than maxchild kids
-            last if $self->maxconn && $self->conn >= $self->maxconn;
-            while ($reap) {
-                my $pid = wait;
-                $self->log( 3, "Reaped child process $pid" );
-                $reap--;
+            my $child = fork;
+            if ( !defined $child ) {
+                $self->log( 0, "Cannot fork" );
+                $self->maxchild( $self->maxchild - 1 ) if $self->maxchild > 1;
+                next;
+            }
+
+            # the parent process
+            if ($child) {
+                $self->log( 3, "Preforked child process $child" );
+                push @kids, $child;
+            }
+
+            # the child process handles the whole connection
+            else {
+                my $conn = $daemon->accept;
+                $SIG{INT} = 'IGNORE';
+                $self->process($conn);
+                exit;    # let's die!
             }
         }
-        else {
 
-            # the child process handles the connection
-            $self->process($conn);
-            $conn->close;
-            undef $conn;
-            exit;    # let's die!
+        # wait for a signal
+        POSIX::pause();
+
+        # handle zombies
+        while ($reap) {
+            my $pid = wait;
+            @kids = grep { $_ != $pid } @kids;
+            $self->{conn}++;    # Cannot use the interface for RO attributes
+            $self->log( 3, "Reaped child process $pid" );
+            $reap--;
         }
+
+        # did a child send us information?
+        if ($hupped) {
+
+            # TODO
+        }
+
+        # this was the last child we forked
+        last if $self->maxconn && $self->conn >= $self->maxconn;
     }
-    $self->log( 0, "Done " . $self->conn . " connection(s)" );
+
+    # wait for remaining children
+    $self->log( 3, "Remaining kids: @kids" );
+    kill INT => @kids;
+
+    while (@kids) {
+        my $pid = wait;
+        @kids = grep { $_ != $pid } @kids;
+        $self->log( 3, "Waited for child process $pid" );
+    }
+
+    $self->log( 1, "Processed " . $self->conn . " connection(s)" );
     return $self->conn;
 }
 
+# semi-private init method
 sub init {
     my $self = shift;
 
     $self->_init_daemon if ( !defined $self->daemon );
     $self->_init_agent  if ( !defined $self->agent );
+
+    # specific agent config
+    $self->agent->requests_redirectable( [] );
+    $self->agent->protocols_forbidden(
+        [ @{ $self->agent->protocols_forbidden || [] }, 'mailto', 'file' ] );
     return;
 }
 
@@ -223,12 +324,14 @@ sub init {
 #
 
 sub _init_daemon {
-    my $self   = shift;
-    my $daemon = HTTP::Daemon->new(
+    my $self = shift;
+    my %args = (
         LocalHost => $self->host,
         LocalPort => $self->port,
         ReuseAddr => 1,
-      )
+    );
+    delete $args{LocalPort} unless $self->port;    # 0 means autoselect
+    my $daemon = HTTP::Daemon->new(%args)
       or die "Cannot initialize proxy daemon: $!";
     $daemon->product_tokens("HTTP-Daemon/$VERSION");
     $self->daemon($daemon);
@@ -238,9 +341,8 @@ sub _init_daemon {
 sub _init_agent {
     my $self  = shift;
     my $agent = LWP::UserAgent->new(
-        env_proxy             => 1,
-        keep_alive            => 2,
-        requests_redirectable => [],
+        env_proxy  => 1,
+        keep_alive => 2,
       )
       or die "Cannot initialize proxy agent: $!";
     $self->agent($agent);
@@ -249,36 +351,67 @@ sub _init_agent {
 
 =head2 Other methods
 
+=over 4
+
 =cut
 
 sub process {
     my ( $self, $conn ) = @_;
-    while ( my $req = $conn->get_request() ) {
-        unless ( defined $req ) {
-            $self->log( 0, "Getting request failed:", $conn->reason );
-            return;
-        }
-        $self->log( 1, "($$) Request: " . $req->uri );
-        $self->log( 5, "($$) Request: " . $req->headers->as_string );
-	# handle the Connection: header from the request
-        my $res = $self->agent->simple_request($req);
-        $conn->print( $res->as_string );
-        $self->log( 1, "($$) Response: " . $res->status_line );
-        $self->log( 5, "($$) Response: " . $res->headers->as_string );
+    my $response;
+    my $req = $conn->get_request();
+
+    unless ( defined $req ) {
+        $self->log( 0, "Getting request failed:", $conn->reason );
     }
+
+    # can we serve this protocol?
+    if ( !$self->agent->is_protocol_supported( my $s = $req->uri->scheme ) ) {
+        $response = new HTTP::Response( 501, 'Not Implemented' );
+        $response->content(
+            "Scheme $s is not supported by the proxy's LWP::UserAgent");
+        goto SEND; # yuck :-)
+    }
+
+    # massage the request to pop a response
+    $req->headers->remove_header('Proxy-Connection'); # broken header
+    $self->log( 1, "($$) Request:", $req->uri );
+    $self->log( 5, "($$) Request:", $req->headers->as_string );
+    $response = $self->agent->simple_request($req);
+
+    SEND:
+    # remove Connection: headers from the response
+    $response->headers->header(Connection => 'close' );
+
+    # send the response
+    $conn->print( $response->as_string );
+    $self->log( 1, "($$) Response:", $response->status_line );
+    $self->log( 5, "($$) Response:", $response->headers->as_string );
 }
+
+=item log( $level, $message )
+
+Adds $message at the end of C<logfh>, if $level is greater than C<verbose>,
+the log() method also prints a timestamp.
+
+=cut
 
 sub log {
     my $self  = shift;
     my $level = shift;
-    my $fh = $self->logfh;
+    my $fh    = $self->logfh;
 
     return if $self->verbose < $level;
 
+    my ( $prefix, $msg ) = ( @_, '' );
+    my @lines = split /\n/, $msg;
+    @lines = ('') if not @lines;
+
     flock( $fh, LOCK_EX );
-    print $fh "[" . localtime() . "] $_\n" for @_;
+    print $fh "[" . localtime() . "] $prefix $_\n" for @lines;
     flock( $fh, LOCK_UN );
 }
+
+=back
 
 =head2 Callbacks
 
@@ -297,14 +430,25 @@ Some connections to the client are never closed.
 =head1 TODO
 
 * Provide an interface for logging.
- 
-* Remove forking, so that all data is in one place
 
 * Provide control over the proxy through special URLs
 
 =head1 AUTHOR
 
 Philippe "BooK" Bruhat, E<lt>book@cpan.orgE<gt>.
+
+=head1 THANKS
+
+Many people helped me during the development of this module, either on
+mailing-lists, irc, or over a beer in a pub...
+
+So, in no particular order, thanks to Michael Schwern (testing while forking),
+Eric 'echo' Cholet (preforked processes).
+
+=head1 COPYRIGHT
+
+This module is free software; you can redistribute it or modify it under
+the same terms as Perl itself.
 
 =cut
 
