@@ -1,5 +1,6 @@
 package HTTP::Proxy::BodyFilter;
 
+use strict;
 use Carp;
 
 sub new {
@@ -87,6 +88,11 @@ filters that follows, until the data reaches its recipient.
 
 A HTTP::Proxy::BodyFilter object is a blessed hash, and the base class
 reserves only hash keys that start with C<_hpbf>.
+
+=item new()
+
+The constructor is defined for all subclasses. Initialisation tasks
+(if any) for subclasses should be done in the C<init()> method (see below).
 
 =item init()
 
@@ -229,11 +235,11 @@ Philippe "BooK" Bruhat, E<lt>book@cpan.orgE<gt>.
 
 =head1 SEE ALSO
 
-HTTP::Proxy, HTTP::Proxy::HeaderFilter.
+L<HTTP::Proxy>, L<HTTP::Proxy::HeaderFilter>.
 
 =head1 COPYRIGHT
 
-Copyright 2003-2005, Philippe Bruhat
+Copyright 2003-2005, Philippe Bruhat.
 
 =head1 LICENSE
 

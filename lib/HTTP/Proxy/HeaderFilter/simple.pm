@@ -6,6 +6,47 @@ use HTTP::Proxy::HeaderFilter;
 use vars qw( @ISA );
 @ISA = qw( HTTP::Proxy::HeaderFilter );
 
+my $methods = join '|', qw( begin filter );
+$methods = qr/^(?:$methods)$/;
+
+sub init {
+    my $self = shift;
+
+    croak "Constructor called without argument" unless @_;
+    if ( @_ == 1 ) {
+        croak "Single parameter must be a CODE reference"
+          unless ref $_[0] eq 'CODE';
+        $self->{_filter} = $_[0];
+    }
+    else {
+        while (@_) {
+            my ( $name, $code ) = splice @_, 0, 2;
+
+            # basic error checking
+            croak "Parameter to $name must be a CODE reference"
+              unless ref $code eq 'CODE';
+            croak "Unkown method $name" unless $name =~ $methods;
+
+            $self->{"_$name"} = $code;
+        }
+    }
+}
+
+# transparently call the actual methods
+sub begin       { goto &{ $_[0]{_begin} }; }
+sub filter      { goto &{ $_[0]{_filter} }; }
+
+sub can {
+    my ( $self, $method ) = @_;
+    return $method =~ $methods
+      ? $self->{"_$method"}
+      : UNIVERSAL::can( $self, $method );
+}
+
+1;
+
+__END__
+
 =head1 NAME
 
 HTTP::Proxy::HeaderFilter::simple - A class for creating simple filters
@@ -37,45 +78,41 @@ for header filters:
 
 This code reference is used for the filter() method.
 
-=cut
+=head1 METHODS
 
-my $methods = join '|', qw( start filter );
-$methods = qr/^(?:$methods)$/;
+This filter "factory" defines the standard HTTP::Proxy::HeaderFilter
+methods, but those are only, erm, "proxies" to the actual CODE references
+passed to the constructor. These "proxy" methods are:
 
-sub init {
-    my $self = shift;
+=over 4
 
-    croak "Constructor called without argument" unless @_;
-    if ( @_ == 1 ) {
-        croak "Single parameter must be a CODE reference"
-          unless ref $_[0] eq 'CODE';
-        $self->{_filter} = $_[0];
-    }
-    else {
-        while (@_) {
-            my ( $name, $code ) = splice @_, 0, 2;
+=item filter()
 
-            # basic error checking
-            croak "Parameter to $name must be a CODE reference"
-              unless ref $code eq 'CODE';
-            croak "Unkown method $name" unless $name =~ $methods;
+=item begin()
 
-            $self->{"_$name"} = $code;
-        }
-    }
-}
+=back
 
-# transparently call the actual methods
-sub start       { goto &{ $_[0]{_start} }; }
-sub filter      { goto &{ $_[0]{_filter} }; }
+Two other methods are actually HTTP::Proxy::HeaderFilter::simple methods,
+and are called automatically:
 
-sub can {
-    my ( $self, $method ) = @_;
-    return $method =~ $methods
-      ? $self->{"_$method"}
-      : UNIVERSAL::can( $self, $method );
-}
+=over 4
 
+=item init()
+
+Initalise the filter instance with the code references passed to the
+constructor.
+
+=item can()
+
+Return the actual code reference that will be run, and not the "proxy"
+methods. If called with any other name than C<begin> and C<filter>,
+it calls UNIVERSAL::can() instead.
+
+=back
+
+=head1 SEE ALSO
+
+L<HTTP::Proxy>, L<HTTP::Proxy::HeaderFilter>.
 
 =head1 AUTHOR
 
@@ -83,7 +120,7 @@ Philippe "BooK" Bruhat, E<lt>book@cpan.orgE<gt>.
 
 =head1 COPYRIGHT
 
-Copyright 2003-2004, Philippe Bruhat
+Copyright 2003-2005, Philippe Bruhat.
 
 =head1 LICENSE
 
@@ -92,4 +129,3 @@ the same terms as Perl itself.
 
 =cut
 
-1;
