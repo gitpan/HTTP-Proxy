@@ -16,21 +16,22 @@ use vars qw( $VERSION $AUTOLOAD
 require Exporter;
 @ISA    = qw(Exporter);
 @EXPORT = ();               # no export by default
-@EXPORT_OK   = qw( NONE ERROR STATUS PROCESS HEADERS FILTER ALL );
-%EXPORT_TAGS = ( log => [@EXPORT_OK] );                           # only one tag
+@EXPORT_OK = qw( NONE ERROR STATUS PROCESS CONNECT HEADERS FILTER ALL );
+%EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = 0.06;
+$VERSION = 0.07;
 
-my $CRLF = "\015\012";    # "\r\n" is not portable
+my $CRLF = "\015\012";                     # "\r\n" is not portable
 
 # constants used for logging
+use constant ERROR   => -1;
 use constant NONE    => 0;
-use constant ERROR   => 0;
 use constant STATUS  => 1;
 use constant PROCESS => 2;
-use constant HEADERS => 4;
-use constant FILTER  => 8;
-use constant ALL     => 15;
+use constant CONNECT => 4;
+use constant HEADERS => 8;
+use constant FILTER  => 16;
+use constant ALL     => 31;
 
 # Methods we can forward
 my @METHODS = qw( OPTIONS GET HEAD POST PUT DELETE TRACE );
@@ -91,7 +92,9 @@ sub new {
         logmask  => NONE,
         maxchild => 10,
         maxconn  => 0,
+        maxserve => 10,
         port     => 8080,
+        timeout  => 60,
         @_,
     };
 
@@ -105,17 +108,9 @@ sub new {
     return $self;
 }
 
-# AUTOLOADed attributes
-my $all_attr = qr/^(?:agent|chunk|conn|control_regex|daemon|host|logfh|
-                      loop|maxchild|maxconn|port|request|response|
-                      logmask)$/x;
-
-# read-only attributes
-my $ro_attr = qr/^(?:conn|control_regex|loop)$/;
-
 =head2 Accessors
 
-The HTTP::Proxy has several accessors. They are all AUTOLOADed.
+The HTTP::Proxy has several accessors.
 
 Called with arguments, the accessor returns the current value.
 Called with a single argument, it set the current value and
@@ -197,12 +192,34 @@ to handle client requests (default: 16).
 
 =item maxconn
 
-The maximum number of connections the proxy will accept before returning
-from start(). 0 (the default) means never stop accepting connections.
+The maximum number of TCP connections the proxy will accept before
+returning from start(). 0 (the default) means never stop accepting
+connections.
+
+=item maxserve
+
+The maximum number of requests the proxy will serve in a single connection.
+(same as MaxRequestsPerChild in Apache)
 
 =item port
 
 The proxy HTTP::Daemon port (default: 8080).
+
+=item timeout
+
+The timeout used by the internal LWP::UserAgent (default: 60).
+
+=cut
+
+sub timeout {
+    my $self = shift;
+    my $old  = $self->{timeout};
+    if (@_) {
+        $self->{timeout} = shift;
+        $self->agent->timeout( $self->{timeout} ) if $self->agent;
+    }
+    return $old;
+}
 
 =item url (read-only)
 
@@ -223,33 +240,25 @@ sub url {
 
 =cut
 
-sub AUTOLOAD {
+# normal accessors
+for my $attr (
+    qw( agent chunk daemon host logfh maxchild maxconn maxserve port
+    request response logmask )
+  )
+{
+    no strict 'refs';
+    *{"HTTP::Proxy::$attr"} = sub {
+        my $self = shift;
+        my $old  = $self->{$attr};
+        $self->{$attr} = shift if @_;
+        return $old;
+      }
+}
 
-    # we don't DESTROY
-    return if $AUTOLOAD =~ /::DESTROY/;
-
-    # fetch the attribute name
-    $AUTOLOAD =~ /.*::(\w+)/;
-    my $attr = $1;
-
-    # must be one of the registered subs
-    if ( $attr =~ $all_attr ) {
-        no strict 'refs';
-        my $rw = 1;
-        $rw = 0 if $attr =~ $ro_attr;
-
-        # create and register the method
-        *{$AUTOLOAD} = sub {
-            my $self = shift;
-            my $old  = $self->{$attr};
-            $self->{$attr} = shift if @_ && $rw;
-            return $old;
-        };
-
-        # now do it
-        goto &{$AUTOLOAD};
-    }
-    croak "Undefined method $AUTOLOAD";
+# read-only accessors
+for my $attr (qw( conn control_regex loop )) {
+    no strict 'refs';
+    *{"HTTP::Proxy::$attr"} = sub { return $_[0]->{$attr} }
 }
 
 =head2 The start() method
@@ -279,6 +288,7 @@ sub start {
         for my $fh (@ready) {    # there's only one, anyway
             if ( @kids >= $self->maxchild ) {
                 $self->log( PROCESS, "Too many child process" );
+                select( undef, undef, undef, 1 );
                 last;
             }
 
@@ -288,7 +298,10 @@ sub start {
             if ( !defined $child ) {
                 $conn->close;
                 $self->log( ERROR, "Cannot fork" );
-                $self->maxchild( $self->maxchild - 1 ) if $self->maxchild > 1;
+                $self->maxchild( $self->maxchild - 1 )
+                  if $self->maxchild > @kids;
+                $self->log( ERROR, "Really cannot fork, abandon" ), last
+                  if $self->maxchild == 0;
                 next;
             }
 
@@ -300,6 +313,7 @@ sub start {
 
             # the child process handles the whole connection
             else {
+                $SIG{INT} = 'DEFAULT';
                 $self->serve_connections($conn);
                 exit;    # let's die!
             }
@@ -322,8 +336,10 @@ sub start {
 
 # private reaper sub
 sub _reap {
-    my ( $self, $kids, $pid ) = @_;
-    while ( ( $pid = waitpid( -1, WNOHANG ) ) && $pid != -1 ) {
+    my ( $self, $kids ) = @_;
+    while (1) {
+        my $pid = waitpid( -1, &WNOHANG );
+        last if $pid == 0 || $pid == -1;    # AS/Win32 returns negative PIDs
         @$kids = grep { $_ != $pid } @$kids;
         $self->{conn}++;    # Cannot use the interface for RO attributes
         $self->log( PROCESS, "Reaped child process $pid" );
@@ -347,13 +363,8 @@ sub init {
     $self->agent->protocols_allowed( [qw( http https ftp gopher )] );
 
     # standard header filters
-    $self->{headers}{request} = [ [ sub { 1 }, \&_proxy_headers_filter ] ];
-    $self->{headers}{response} = [
-        [ sub { 1 }, \&_proxy_headers_filter ],
-
-        # We do not support keep-alive connections for the moment
-        [ sub { 1 }, sub { $_[0]->header( Connection => 'close' ) } ]
-    ];
+    $self->{headers}{request}  = [ [ sub { 1 }, \&_proxy_headers_filter ] ];
+    $self->{headers}{response} = [ [ sub { 1 }, \&_proxy_headers_filter ] ];
 
     # standard bodyfilters
     $self->{body}{request}  = [];
@@ -375,7 +386,7 @@ sub _init_daemon {
     delete $args{LocalPort} unless $self->port;    # 0 means autoselect
     my $daemon = HTTP::Daemon->new(%args)
       or die "Cannot initialize proxy daemon: $!";
-    $daemon->product_tokens("HTTP-Daemon/$VERSION");
+    $daemon->product_tokens('');
     $self->daemon($daemon);
     return $daemon;
 }
@@ -385,6 +396,8 @@ sub _init_agent {
     my $agent = LWP::UserAgent->new(
         env_proxy  => 1,
         keep_alive => 2,
+        parse_head => 0,
+        timeout    => $self->timeout,
       )
       or die "Cannot initialize proxy agent: $!";
     $self->agent($agent);
@@ -398,97 +411,128 @@ sub serve_connections {
     my ( $self, $conn ) = @_;
     my $response;
 
-    $SIG{INT} = 'IGNORE';    # don't interrupt while we talk to a client
-    my $req = $conn->get_request();
+    my ( $last, $served ) = ( 0, 0 );
+    while ( my $req = $conn->get_request() ) {
 
-    # Got a request?
-    unless ( defined $req ) {
-        $self->log( ERROR, "($$) Getting request failed:", $conn->reason );
-        return;
-    }
-    $self->log( STATUS, "($$) Request:", $req->method . ' ' . $req->uri );
-
-    # can we forward this method?
-    if ( !grep { $_ eq $req->method } @METHODS ) {
-        $response = new HTTP::Response( 501, 'Not Implemented' );
-        $response->content(
-            "Method " . $req->method . " is not supported by this proxy." );
-        goto SEND;
-    }
-
-    # can we serve this protocol?
-    if ( !$self->agent->is_protocol_supported( my $s = $req->uri->scheme ) ) {
-        $response = new HTTP::Response( 501, 'Not Implemented' );
-        $response->content("Scheme $s is not supported by this proxy.");
-        goto SEND;
-    }
-
-    # massage the request
-    $self->request($req);
-    $self->_filter_headers('request');
-    $self->_filter_body('request');
-    $self->log( HEADERS, "($$) Request:", $req->headers->as_string );
-
-    # pop a response
-    my ( $sent, $buf ) = ( 0, '' );
-    $response = $self->agent->simple_request(
-        $req,
-        sub {
-            my ( $data, $response, $proto ) = @_;
-
-            # first time, filter the headers
-            if ( !$sent ) {
-                $self->response($response);
-                $self->_filter_headers('response');
-                $self->log( STATUS, "($$) Response:", $response->status_line );
-                $self->log(
-                    HEADERS,
-                    "($$) Response:",
-                    $response->headers->as_string
-                );
-
-                # send the headers
-                $conn->print( $HTTP::Daemon::PROTO, ' ', $response->status_line,
-                    $CRLF, $response->headers->as_string($CRLF), $CRLF );
-                $sent++;
-            }
-
-            # filter and send the data
-            $self->log( FILTER, "($$) Filter:",
-                "got " . length($data) . " bytes of body data" );
-            $self->_filter_body( 'response', \$data, $proto );
-            $conn->print($data);
-        },
-        $self->chunk
-    );
-
-    # only success (2xx) responses are filtered through callbacks
-    if ( !$sent ) {
-        $self->response($response);
-        $self->_filter_headers('response');
-    }
-
-    # what about X-Died and X-Content-Range?
-
-    $SIG{INT} = 'DEFAULT', return if $sent;
-
-  SEND:
-
-    # send the response
-    if ( $req->uri->scheme =~ /^(?:ftp|gopher)$/ && $response->is_success ) {
-        $conn->print( $response->content );
-    }
-    else {
-        $conn->print( $HTTP::Daemon::PROTO, ' ', $response->status_line, $CRLF,
-            $response->headers->as_string($CRLF), $CRLF );
-        if ( !$response->content && $response->is_error ) {
-            $response->content( $response->error_as_HTML );
+        # Got a request?
+        unless ( defined $req ) {
+            $self->log( ERROR, "($$) Getting request failed:", $conn->reason );
+            return;
         }
-        $conn->print( $response->content );
+        $self->log( STATUS, "($$) Request:", $req->method . ' ' . $req->uri );
+
+        # can we forward this method?
+        if ( !grep { $_ eq $req->method } @METHODS ) {
+            $response = new HTTP::Response( 501, 'Not Implemented' );
+            $response->content(
+                "Method " . $req->method . " is not supported by this proxy." );
+            goto SEND;
+        }
+
+        # can we serve this protocol?
+        if ( !$self->agent->is_protocol_supported( my $s = $req->uri->scheme ) )
+        {
+            $response = new HTTP::Response( 501, 'Not Implemented' );
+            $response->content("Scheme $s is not supported by this proxy.");
+            goto SEND;
+        }
+
+        # massage the request
+        $self->request($req);
+        $self->_filter_headers('request');
+        $self->_filter_body('request');
+        $self->log( HEADERS, "($$) Request:", $req->headers->as_string );
+
+        # pop a response
+        my ( $sent, $chunked ) = ( 0, 0 );
+        $response = $self->agent->simple_request(
+            $req,
+            sub {
+                my ( $data, $response, $proto ) = @_;
+
+                # first time, filter the headers
+                if ( !$sent ) {
+                    $self->response($response);
+                    $self->_filter_headers('response');
+
+                    # this is adapted from HTTP::Daemon
+                    if ( $conn->antique_client ) { $last++ }
+                    else {
+                        my $code = $response->code;
+                        $conn->send_basic_header( $code, $response->message,
+                            $response->protocol );
+                        if ( $code =~ /^(1\d\d|[23]04)$/ ) {
+
+                            # make sure content is empty
+                            $response->remove_header("Content-Length");
+                            $response->content('');
+                        }
+                        elsif ($response->request
+                            && $response->request->method eq "HEAD" )
+                        {
+
+                            # probably OK
+                        }
+                        else {
+                            if ( $conn->proto_ge("HTTP/1.1") ) {
+                                $response->push_header(
+                                    "Transfer-Encoding" => "chunked" );
+                                $chunked++;
+                            }
+                            else {
+                                $last++;
+                                $conn->force_last_request;
+                            }
+                        }
+                        print $conn $response->headers_as_string($CRLF);
+                        print $conn $CRLF;    # separates headers and content
+                    }
+                    $sent++;
+                }
+
+                # filter and send the data
+                $self->log( FILTER, "($$) Filter:",
+                    "got " . length($data) . " bytes of body data" );
+                $self->_filter_body( 'response', \$data, $proto );
+                if ($chunked) {
+                    printf $conn "%x%s%s%s", length($data), $CRLF, $data, $CRLF;
+                }
+                else {
+                    print $conn $data;
+                }
+            },
+            $self->chunk
+        );
+
+        print $conn "0$CRLF$CRLF" if $chunked;    # no trailers either
+
+        # what about X-Died and X-Content-Range?
+
+      SEND:
+
+        # responses that weren't filtered through callbacks
+        if ( !$sent ) {
+            $self->response($response);
+            $self->_filter_headers('response');
+            $conn->send_response($response);
+        }
+
+        # FIXME ftp, gopher
+        if ( $req->uri->scheme =~ /^(?:ftp|gopher)$/ && $response->is_success )
+        {
+            $conn->print( $response->content );
+        }
+
+        $self->log( STATUS,  "($$) Response:", $response->status_line );
+        $self->log( HEADERS, "($$) Response:", $response->headers->as_string );
+        $served++;
+        last if $last || $served >= $self->maxserve;
     }
-    $self->log( STATUS,  "($$) Response:", $response->status_line );
-    $self->log( HEADERS, "($$) Response:", $response->headers->as_string );
-    $SIG{INT} = 'DEFAULT';
+    $self->log( CONNECT, "($$) Connection closed by the client" )
+      if !$last
+      and $served < $self->maxserve;
+    $self->log( PROCESS, "($$) Served $served requests" );
+    $conn->close;
 }
 
 =head2 Callbacks
@@ -835,28 +879,29 @@ logging constants.
 
 =head1 BUGS
 
+This does not work under Windows, but I can't see why, and do not have
+a development platform under that system. Patches and explanations
+very welcome.
+
 This is still beta software, expect some interfaces to change as
 I receive feedback from users.
-
-=head1 TODO
-
-* correctly handle the Content-Length
-
-* Provide a better interface for logging.
-
-* Provide control over the proxy through special URLs
 
 =head1 AUTHOR
 
 Philippe "BooK" Bruhat, E<lt>book@cpan.orgE<gt>.
+
+The module has its own web page at http://http-proxy.mongueurs.net/
+complete with older versions and repository snapshot.
 
 =head1 THANKS
 
 Many people helped me during the development of this module, either on
 mailing-lists, irc or over a beer in a pub...
 
-So, in no particular order, thanks to Michael Schwern (testing while forking),
-the Paris.pm folks (forking processes) and my growing user base... C<;-)>
+So, in no particular order, thanks to the libwww-perl team for such
+a terrific suite of modules, Michael Schwern (tips for testing while
+forking), the Paris.pm folks (forking processes, chunked encoding)
+and my growing user base... C<;-)>
 
 =head1 COPYRIGHT
 

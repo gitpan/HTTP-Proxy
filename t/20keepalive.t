@@ -3,10 +3,9 @@ use vars qw( @requests );
 
 # here are all the requests the client will try
 BEGIN {
-    @requests = qw(
-      file1.txt
-      directory/file2.txt
-      ooh.cgi?q=query
+    @requests = (
+        'single.txt',
+        ( 'file1.txt', 'directory/file2.txt', 'ooh.cgi?q=query' ) x 2
     );
 }
 
@@ -25,7 +24,11 @@ $test->no_ending(1);
 # create a HTTP::Daemon (on an available port)
 my $server = server_start();
 
-my $proxy = HTTP::Proxy->new( port => 0, maxconn => scalar @requests );
+my $proxy = HTTP::Proxy->new(
+    port     => 0,
+    maxserve => 3,
+    maxconn  => 3,
+);
 $proxy->init;    # required to access the url later
 
 # fork the HTTP server
@@ -61,7 +64,7 @@ push @pids, $pid;    # remember the kid
 fork_proxy(
     $proxy,
     sub {
-        is( $proxy->conn, scalar @requests,
+        is( $proxy->conn, 3,
             "The proxy served the correct number of connections" );
     }
 );
@@ -70,11 +73,14 @@ fork_proxy(
 push @pids, $pid;    # remember the kid
 
 # run a client
-my $ua = LWP::UserAgent->new;
+my $ua = LWP::UserAgent->new( keep_alive => 1 );
 $ua->proxy( http => $proxy->url );
 
-for (@requests) {
+# the first connection will be closed by the client
+my $first = 0;
+for (@requests ) {
     my $req = HTTP::Request->new( GET => $server->url . $_ );
+    $req->headers->header( Connection => 'close' ) unless $first++; 
     my $rep = $ua->simple_request($req);
     ok( $rep->is_success, "Got an answer (@{[$rep->status_line]})" );
     my $re = quotemeta;
