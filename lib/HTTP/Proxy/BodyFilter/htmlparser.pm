@@ -6,7 +6,7 @@ use base qw( HTTP::Proxy::BodyFilter );
 
 =head1 NAME
 
-HTTP::Proxy::BodyFilter::htmltext - A filter to transmogrify HTML text
+HTTP::Proxy::BodyFilter::htmlparser - Filter using HTML::Parser
 
 =head1 SYNOPSIS
 
@@ -15,7 +15,7 @@ HTTP::Proxy::BodyFilter::htmltext - A filter to transmogrify HTML text
     # $parser is a HTML::Parser object
     $proxy->push_filter(
         mime     => 'text/html',
-        response => HTTP::Proxy::BodyFilter::htmltext->new( $parser );
+        response => HTTP::Proxy::BodyFilter::htmlparser->new( $parser );
     );
 
 =head1 DESCRIPTION
@@ -36,12 +36,14 @@ origin server.
 
 A read-write filter is declared by passing C<rw =E<gt> 1> to the constructor:
 
-     HTTP::Proxy::BodyFilter::htmltext->new( $parser, rw => 1 );
+     HTTP::Proxy::BodyFilter::htmlparser->new( $parser, rw => 1 );
 
 =head2 Creating a HTML::Parser that rewrites pages
 
+To be able to modify files, a filter must rewrite them completely.
 The HTML::Parser object can update a special attribute named C<output>.
-To do so, the handler will have to request the C<self> attribute.
+To do so, the handler will have to request the C<self> attribute
+and update its C<output> key.
 
 Other attributes are made available by this filter to the HTML::Parser
 object:
@@ -55,6 +57,8 @@ A string that will hold the data sent back by the proxy.
 This string will be used as a replacement for the body data only
 if the filter is read-write, that is to say, if it was initialised with
 C<rw =E<gt> 1>.
+
+Data should always be B<appended> to C<$parser-E<gt>{output}>.
 
 =item message
 

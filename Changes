@@ -1,5 +1,26 @@
 Revision history for Perl extension HTTP::Proxy
 
+0.11  Fri Jan  2 17:02:08 CET 2004
+        [ENHANCEMENTS]
+        - setting maxchild to 0 prevents forking (Jim Cromie)
+        - filters can now match on the query string
+        - hop-by-hop headers and Max-Forwards headers are correctly supported
+        - new mutators added to HTTP::Proxy: via, hop_headers, request,
+          response
+        - filters can now answer in place of the server, which allows
+          for authorisation filters, cache (?) filters, etc.
+        - new examples scripts: proxy-auth.pl
+        [FIXES]
+        - push_filter() now correctly supports several match criteria
+        [TESTS]
+        - all the Via: header tests are now in t/50via.t
+        - t/50standard.t now checks headers for several request types
+        - new tests:
+          + t/51simple2.t - check response header filters with an actual proxy
+          + t/61simple2.t - check response body filters with an actual proxy
+        [INTERNALS]
+        - new method _send_response_headers
+
 0.10  Wed Nov 19 01:36:59 CET 2003
 
         *** MAJOR INTERFACE CHANGES ***
@@ -7,13 +28,13 @@ Revision history for Perl extension HTTP::Proxy
         - new base classes HTTP::Proxy::HeaderFilter and
           HTTP::Proxy::BodyFilter
         - some useful built-in filter classes:
-          HTTP::Proxy::BodyFiler::htmlparser
-          HTTP::Proxy::BodyFiler::htmltext
-          HTTP::Proxy::BodyFiler::lines
-          HTTP::Proxy::BodyFiler::simple
-          HTTP::Proxy::BodyFiler::tags
-          HTTP::Proxy::HeaderFiler::simple
-          HTTP::Proxy::HeaderFiler::standard
+          HTTP::Proxy::BodyFilter::htmlparser
+          HTTP::Proxy::BodyFilter::htmltext
+          HTTP::Proxy::BodyFilter::lines
+          HTTP::Proxy::BodyFilter::simple
+          HTTP::Proxy::BodyFilter::tags
+          HTTP::Proxy::HeaderFilter::simple
+          HTTP::Proxy::HeaderFilter::standard
         - tests for the internal class HTTP::Proxy::FilterStack
         - tests for the built-in filters
         - the examples are up-to-date with the new interface 
@@ -58,7 +79,7 @@ Revision history for Perl extension HTTP::Proxy
         - put some of the test functions in a test module (t::Utils)
 
 0.05  Tue Feb  4 00:47:23 CET 2003
-        - explicitely refuse CONNECT
+        - explicitly refuse CONNECT
         - better support for TRACE method
         - support the Via: Header (a MUST in RFC 2616)
         - filters, but this needs more work
