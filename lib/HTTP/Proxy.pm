@@ -3,17 +3,34 @@ package HTTP::Proxy;
 use HTTP::Daemon;
 use LWP::UserAgent;
 use LWP::ConnCache;
-use Fcntl ':flock';    # import LOCK_* constants
-use POSIX ();
+use Fcntl ':flock';         # import LOCK_* constants
+use POSIX ":sys_wait_h";    # WNOHANG
 use Sys::Hostname;
+use IO::Select;
 use Carp;
 
 use strict;
-use vars qw( $VERSION $AUTOLOAD );
+use vars qw( $VERSION $AUTOLOAD
+  @ISA  @EXPORT @EXPORT_OK %EXPORT_TAGS );
 
-$VERSION = 0.05;
+require Exporter;
+@ISA    = qw(Exporter);
+@EXPORT = ();               # no export by default
+@EXPORT_OK   = qw( NONE ERROR STATUS PROCESS HEADERS FILTER ALL );
+%EXPORT_TAGS = ( log => [@EXPORT_OK] );                           # only one tag
+
+$VERSION = 0.06;
 
 my $CRLF = "\015\012";    # "\r\n" is not portable
+
+# constants used for logging
+use constant NONE    => 0;
+use constant ERROR   => 0;
+use constant STATUS  => 1;
+use constant PROCESS => 2;
+use constant HEADERS => 4;
+use constant FILTER  => 8;
+use constant ALL     => 15;
 
 # Methods we can forward
 my @METHODS = qw( OPTIONS GET HEAD POST PUT DELETE TRACE );
@@ -70,11 +87,11 @@ sub new {
         control  => 'proxy',
         daemon   => undef,
         host     => 'localhost',
+        logfh    => *STDERR,
+        logmask  => NONE,
         maxchild => 10,
         maxconn  => 0,
-        logfh    => *STDERR,
         port     => 8080,
-        verbose  => 0,
         @_,
     };
 
@@ -91,7 +108,7 @@ sub new {
 # AUTOLOADed attributes
 my $all_attr = qr/^(?:agent|chunk|conn|control_regex|daemon|host|logfh|
                       loop|maxchild|maxconn|port|request|response|
-                      verbose)$/x;
+                      logmask)$/x;
 
 # read-only attributes
 my $ro_attr = qr/^(?:conn|control_regex|loop)$/;
@@ -153,6 +170,26 @@ The proxy HTTP::Daemon host (default: 'localhost').
 
 A filehandle to a logfile (default: *STDERR).
 
+=item logmask( [$mask] )
+
+Be verbose in the logs (default: NONE).
+
+Here are the various elements that can be added to the mask:
+ NONE    - Log only errors
+ STATUS  - Requested URL, reponse status and total number
+           of connections processed
+ PROCESS - Subprocesses information (fork, wait, etc.)
+ HEADERS - Full request and response headers are sent along
+ FILTER  - Filter information
+ ALL     - Log all of the above
+
+If you only want status and process information, you can use:
+
+    $proxy->logmask( STATUS | PROCESS );
+
+Note that all the logging constants are not exported by default, but 
+by the C<:log> tag. They can also be exported one by one.
+
 =item maxchild
 
 The maximum number of child process the HTTP::Proxy object will spawn
@@ -181,18 +218,6 @@ sub url {
     }
     return $self->daemon->url;
 }
-
-=item verbose
-
-Be verbose in the logs (default: 0).
-
-Here are the various log levels:
- 0 - All errors
- 1 - Requested URL, reponse status and total number of connections processed
- 2 -
- 3 - Subprocesses information (fork, wait, etc.)
- 4 -
- 5 - Full request and response headers are sent along
 
 =back
 
@@ -239,82 +264,71 @@ at most that many connections.
 
 sub start {
     my $self = shift;
-    $self->init;
-
     my @kids;
-    my $reap;
-    my $hupped;
 
-    # zombies reaper
-    my $reaper;
-    $reaper = sub {
-        $reap++;
-        $SIG{CHLD} = $reaper;    # for sysV systems
-    };
-    $SIG{CHLD} = $reaper;
-    $SIG{HUP}  = sub { $hupped++ };
+    # some initialisation
+    $self->init;
+    $SIG{INT} = $SIG{KILL} = sub { $self->{loop} = 0 };
 
     # the main loop
-    my $daemon = $self->daemon;
+    my $select = IO::Select->new( $self->daemon );
     while ( $self->loop ) {
 
-        # prefork children process
-        for ( 1 .. $self->maxchild - @kids ) {
+        # check for new connections
+        my @ready = $select->can_read(0.01);
+        for my $fh (@ready) {    # there's only one, anyway
+            if ( @kids >= $self->maxchild ) {
+                $self->log( PROCESS, "Too many child process" );
+                last;
+            }
 
+            # accept the new connection
+            my $conn  = $fh->accept;
             my $child = fork;
             if ( !defined $child ) {
-                $self->log( 0, "Cannot fork" );
+                $conn->close;
+                $self->log( ERROR, "Cannot fork" );
                 $self->maxchild( $self->maxchild - 1 ) if $self->maxchild > 1;
                 next;
             }
 
             # the parent process
             if ($child) {
-                $self->log( 3, "Preforked child process $child" );
+                $self->log( PROCESS, "Forked child process $child" );
                 push @kids, $child;
             }
 
             # the child process handles the whole connection
             else {
-                $self->serve_connections($daemon);
+                $self->serve_connections($conn);
                 exit;    # let's die!
             }
         }
 
-        # wait for a signal
-        POSIX::pause();
-
         # handle zombies
-        while ($reap) {
-            my $pid = wait;
-            @kids = grep { $_ != $pid } @kids;
-            $self->{conn}++;    # Cannot use the interface for RO attributes
-            $self->log( 3, "Reaped child process $pid" );
-            $reap--;
-        }
-
-        # did a child send us information?
-        if ($hupped) {
-
-            # TODO
-        }
+        $self->_reap( \@kids ) if @kids;
 
         # this was the last child we forked
         last if $self->maxconn && $self->conn >= $self->maxconn;
     }
 
     # wait for remaining children
-    $self->log( 3, "Remaining kids: @kids" );
     kill INT => @kids;
+    $self->_reap( \@kids ) while @kids;
 
-    while (@kids) {
-        my $pid = wait;
-        @kids = grep { $_ != $pid } @kids;
-        $self->log( 3, "Waited for child process $pid" );
-    }
-
-    $self->log( 1, "Processed " . $self->conn . " connection(s)" );
+    $self->log( STATUS, "Processed " . $self->conn . " connection(s)" );
     return $self->conn;
+}
+
+# private reaper sub
+sub _reap {
+    my ( $self, $kids, $pid ) = @_;
+    while ( ( $pid = waitpid( -1, WNOHANG ) ) && $pid != -1 ) {
+        @$kids = grep { $_ != $pid } @$kids;
+        $self->{conn}++;    # Cannot use the interface for RO attributes
+        $self->log( PROCESS, "Reaped child process $pid" );
+        $self->log( PROCESS, "Remaining kids: @$kids" );
+    }
 }
 
 # semi-private init method
@@ -381,19 +395,18 @@ sub _init_agent {
 # incoming connections.
 
 sub serve_connections {
-    my ( $self, $daemon ) = @_;
+    my ( $self, $conn ) = @_;
     my $response;
 
-    my $conn = $daemon->accept;
     $SIG{INT} = 'IGNORE';    # don't interrupt while we talk to a client
     my $req = $conn->get_request();
 
     # Got a request?
     unless ( defined $req ) {
-        $self->log( 0, "($$) Getting request failed:", $conn->reason );
+        $self->log( ERROR, "($$) Getting request failed:", $conn->reason );
         return;
     }
-    $self->log( 1, "($$) Request:", $req->method . ' ' . $req->uri );
+    $self->log( STATUS, "($$) Request:", $req->method . ' ' . $req->uri );
 
     # can we forward this method?
     if ( !grep { $_ eq $req->method } @METHODS ) {
@@ -414,7 +427,7 @@ sub serve_connections {
     $self->request($req);
     $self->_filter_headers('request');
     $self->_filter_body('request');
-    $self->log( 5, "($$) Request:", $req->headers->as_string );
+    $self->log( HEADERS, "($$) Request:", $req->headers->as_string );
 
     # pop a response
     my ( $sent, $buf ) = ( 0, '' );
@@ -427,9 +440,12 @@ sub serve_connections {
             if ( !$sent ) {
                 $self->response($response);
                 $self->_filter_headers('response');
-                $self->log( 1, "($$) Response:", $response->status_line );
-                $self->log( 5, "($$) Response:",
-                    $response->headers->as_string );
+                $self->log( STATUS, "($$) Response:", $response->status_line );
+                $self->log(
+                    HEADERS,
+                    "($$) Response:",
+                    $response->headers->as_string
+                );
 
                 # send the headers
                 $conn->print( $HTTP::Daemon::PROTO, ' ', $response->status_line,
@@ -438,7 +454,7 @@ sub serve_connections {
             }
 
             # filter and send the data
-            $self->log( 6, "($$) Filter:",
+            $self->log( FILTER, "($$) Filter:",
                 "got " . length($data) . " bytes of body data" );
             $self->_filter_body( 'response', \$data, $proto );
             $conn->print($data);
@@ -470,8 +486,8 @@ sub serve_connections {
         }
         $conn->print( $response->content );
     }
-    $self->log( 1, "($$) Response:", $response->status_line );
-    $self->log( 5, "($$) Response:", $response->headers->as_string );
+    $self->log( STATUS,  "($$) Response:", $response->status_line );
+    $self->log( HEADERS, "($$) Response:", $response->headers->as_string );
     $SIG{INT} = 'DEFAULT';
 }
 
@@ -502,7 +518,7 @@ It is possible to push the same coderef on the request and response
 stacks, as in the following example:
 
     $proxy->push_header_filter( request => $coderef, response => $coderef );
- 
+
 Named parameters can be added. They are:
 
     mime   - the MIME type (for a response-body filter)
@@ -780,8 +796,8 @@ sub _proxy_headers_filter {
 
 =item log( $level, $prefix, $message )
 
-Adds $message at the end of C<logfh>, if $level is greater than C<verbose>,
-the log() method also prints a timestamp.
+Adds $message at the end of C<logfh>, if $level matches C<logmask>.
+The log() method also prints a timestamp.
 
 The output looks like:
 
@@ -797,7 +813,7 @@ sub log {
     my $level = shift;
     my $fh    = $self->logfh;
 
-    return if $self->verbose < $level;
+    return unless $self->logmask & $level;
 
     my ( $prefix, $msg ) = ( @_, '' );
     my @lines = split /\n/, $msg;
@@ -812,20 +828,21 @@ sub log {
 
 =cut
 
+=head1 EXPORTED SYMBOLS
+
+No symbols are exported by default. The C<:log> tag exports all the
+logging constants.
+
 =head1 BUGS
 
-I've heard that some Unix systems do not support calling accept() in a
-child process when the socket was opened by the parent (especially
-when several child process accept() at the same time).
-
-It looks like it's the case under Windows.
-Expect the prefork system to change soon.
+This is still beta software, expect some interfaces to change as
+I receive feedback from users.
 
 =head1 TODO
 
-* support Windows systems
+* correctly handle the Content-Length
 
-* Provide an interface for logging.
+* Provide a better interface for logging.
 
 * Provide control over the proxy through special URLs
 
@@ -836,10 +853,10 @@ Philippe "BooK" Bruhat, E<lt>book@cpan.orgE<gt>.
 =head1 THANKS
 
 Many people helped me during the development of this module, either on
-mailing-lists, irc, or over a beer in a pub...
+mailing-lists, irc or over a beer in a pub...
 
 So, in no particular order, thanks to Michael Schwern (testing while forking),
-Eric 'echo' Cholet (preforked processes).
+the Paris.pm folks (forking processes) and my growing user base... C<;-)>
 
 =head1 COPYRIGHT
 
