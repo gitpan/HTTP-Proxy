@@ -2,7 +2,9 @@ package HTTP::Proxy::BodyFilter::htmltext;
 
 use strict;
 use Carp;
-use base qw( HTTP::Proxy::BodyFilter );
+use HTTP::Proxy::BodyFilter;
+use vars qw( @ISA );
+@ISA = qw( HTTP::Proxy::BodyFilter );
 
 =head1 NAME
 
@@ -38,7 +40,7 @@ sub init {
     $_[0]->{_filter} = $_[1];
 }
 
-sub start { $_[0]->{js} = 0; }    # init
+sub begin { $_[0]->{js} = 0; }    # per message initialisation
 
 sub filter {
     my ( $self, $dataref, $message, $protocol, $buffer ) = @_;
@@ -64,7 +66,7 @@ sub filter {
             redo SCAN if $self->{js};    # ignore protected
             {
                 local $_ = $1;
-                $self->{_filter}();
+                $self->{_filter}->();
                 substr( $$dataref, $pos, length($1), $_ );
                 pos($$dataref) = $pos + length($_);
             }

@@ -17,10 +17,10 @@ use vars qw( $VERSION $AUTOLOAD @METHODS
 require Exporter;
 @ISA    = qw(Exporter);
 @EXPORT = ();               # no export by default
-@EXPORT_OK = qw( NONE ERROR STATUS PROCESS SOCKET HEADERS FILTER CONNECT ALL );
+@EXPORT_OK = qw( NONE ERROR STATUS PROCESS SOCKET HEADERS FILTERS CONNECT ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = '0.13';
+$VERSION = '0.14';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
 
@@ -34,9 +34,10 @@ use constant STATUS  => 1;     # HTTP status
 use constant PROCESS => 2;     # sub-process life (and death)
 use constant SOCKET  => 4;     # low-level connections
 use constant HEADERS => 8;     # HTTP headers
-use constant FILTER  => 16;    # Data received by the filters
-use constant CONNECT => 32;    # Data transmitted by the CONNECT method
-use constant ALL     => 63;    # All of the above
+use constant FILTERS => 16;    # Messages from filters
+use constant DATA    => 32;    # Data received by the filters
+use constant CONNECT => 64;    # Data transmitted by the CONNECT method
+use constant ALL     => 127;   # All of the above
 
 # Methods we can forward
 @METHODS = qw( OPTIONS GET HEAD POST PUT DELETE TRACE CONNECT );
@@ -77,7 +78,7 @@ HTTP::Proxy - A pure Perl HTTP proxy
 This module implements a HTTP proxy, using a HTTP::Daemon to accept
 client connections, and a LWP::UserAgent to ask for the requested pages.
 
-The most interesting feature of this proxy object is its hability to
+The most interesting feature of this proxy object is its ability to
 filter the HTTP requests and responses through user-defined filters.
 
 =head1 METHODS
@@ -201,8 +202,11 @@ Here are the various elements that can be added to the mask:
  STATUS  - Requested URL, reponse status and total number
            of connections processed
  PROCESS - Subprocesses information (fork, wait, etc.)
+ SOCKET  - Information about low-level sockets
  HEADERS - Full request and response headers are sent along
- FILTER  - Filter information
+ FILTERS - Filter information
+ DATA    - Data received by the filters
+ CONNECT - Data transmitted by the CONNECT method
  ALL     - Log all of the above
 
 If you only want status and process information, you can use:
@@ -348,16 +352,19 @@ sub start {
             # single-process proxy (useful for debugging)
             if ( $self->maxchild == 0 ) {
                 $self->maxserve(1);    # do not block simultaneous connections
-                $self->log( PROCESS, "No fork allowed, serving the connection" );
+                $self->log( PROCESS, "PROCESS",
+                            "No fork allowed, serving the connection" );
                 $self->serve_connections($fh->accept);
                 $self->{conn}++;    # read-only attribute
                 next;
             }
 
             if ( @kids >= $self->maxchild ) {
-                $self->log( PROCESS, "Too many child process" );
-                select( undef, undef, undef, 1 );
-                last;
+                $self->log( ERROR, "PROCESS",
+                            "Too many child process, serving the connection" );
+                $self->serve_connections($fh->accept);
+                $self->{conn}++;    # read-only attribute
+                next;
             }
 
             # accept the new connection
@@ -365,7 +372,7 @@ sub start {
             my $child = fork;
             if ( !defined $child ) {
                 $conn->close;
-                $self->log( ERROR, "Cannot fork" );
+                $self->log( ERROR, "PROCESS", "Cannot fork" );
                 $self->maxchild( $self->maxchild - 1 )
                   if $self->maxchild > @kids;
                 next;
@@ -374,13 +381,14 @@ sub start {
             # the parent process
             if ($child) {
                 $conn->close;
-                $self->log( PROCESS, "Forked child process $child" );
+                $self->log( PROCESS, "PROCESS", "Forked child process $child" );
                 push @kids, $child;
             }
 
             # the child process handles the whole connection
             else {
                 $SIG{INT} = 'DEFAULT';
+                $fh->close;
                 $self->serve_connections($conn);
                 exit;    # let's die!
             }
@@ -397,7 +405,7 @@ sub start {
     kill INT => @kids;
     $self->_reap( \@kids ) while @kids;
 
-    $self->log( STATUS, "Processed " . $self->conn . " connection(s)" );
+    $self->log( STATUS, "STATUS", "Processed " . $self->conn . " connection(s)" );
     return $self->conn;
 }
 
@@ -409,8 +417,8 @@ sub _reap {
         last if $pid == 0 || $pid == -1;    # AS/Win32 returns negative PIDs
         @$kids = grep { $_ != $pid } @$kids;
         $self->{conn}++;    # Cannot use the interface for RO attributes
-        $self->log( PROCESS, "Reaped child process $pid" );
-        $self->log( PROCESS, "Remaining kids: @$kids" );
+        $self->log( PROCESS, "PROCESS", "Reaped child process $pid" );
+        $self->log( PROCESS, "PROCESS", "Remaining kids: @$kids" );
     }
 }
 
@@ -485,7 +493,7 @@ sub serve_connections {
     my ( $self, $conn ) = @_;
     my $response;
     $self->{client_socket} = $conn;  # read-only
-    $self->log( SOCKET, "($$) New connection from " . $conn->peerhost
+    $self->log( SOCKET, "SOCKET", "New connection from " . $conn->peerhost
                       . ":" . $conn->peerport );
 
     my ( $last, $served ) = ( 0, 0 );
@@ -499,10 +507,10 @@ sub serve_connections {
 
         # Got a request?
         unless ( defined $req ) {
-            $self->log( ERROR, "($$) Getting request failed:", $conn->reason );
+            $self->log( ERROR, "ERROR", "Getting request failed:", $conn->reason );
             return;
         }
-        $self->log( STATUS, "($$) Request:", $req->method . ' '
+        $self->log( STATUS, "REQUEST", $req->method . ' '
            . ( $req->method eq 'CONNECT' ? $req->uri->host_port : $req->uri ) );
 
         # can we forward this method?
@@ -513,6 +521,21 @@ sub serve_connections {
                 "Method " . $req->method . " is not supported by this proxy." );
             $self->response($response);
             goto SEND;
+        }
+
+        # transparent proxying support
+        if( not defined $req->uri->scheme ) {
+            if( my $host = $req->header('Host') ) {
+                 $req->uri->scheme( 'http' );
+                 $req->uri->host( $host );
+            }
+            else {
+                $response = HTTP::Response->new( 400, 'Bad request' );
+                $response->content_type( "text/plain" );
+                $response->content("Can't do transparent proxying without a Host: header.");
+                $self->response($response);
+                goto SEND;
+            }
         }
 
         # can we serve this protocol?
@@ -533,7 +556,7 @@ sub serve_connections {
         # NOTE: the request is always received in one piece
         $self->{body}{request}->filter( $req->content_ref, $req, undef );
         $self->{body}{request}->eod;    # end of data
-        $self->log( HEADERS, "($$) Request:", $req->headers->as_string );
+        $self->log( HEADERS, "REQUEST", $req->headers->as_string );
 
         # CONNECT method is a very special case
         if( ! defined $self->response and $req->method eq 'CONNECT' ) {
@@ -564,7 +587,7 @@ sub serve_connections {
                 }
 
                 # filter and send the data
-                $self->log( FILTER, "($$) Filter:",
+                $self->log( DATA, "DATA",
                     "got " . length($data) . " bytes of body data" );
                 $self->{body}{response}->filter( \$data, $response, $proto );
                 if ($chunked) {
@@ -603,7 +626,7 @@ sub serve_connections {
 
         # what about X-Died and X-Content-Range?
         if( my $died = $response->header('X-Died') ) {
-            $self->log( ERROR, "($$) ERROR:", $died );
+            $self->log( ERROR, "ERROR", $died );
             $sent = 0;
             $response = HTTP::Response->new( 500, "Proxy filter error" );
             $response->content_type( "text/plain" );
@@ -630,18 +653,18 @@ sub serve_connections {
         }
 
         # FIXME ftp, gopher
-        if ( $req->uri->scheme =~ /^(?:ftp|gopher)$/ && $response->is_success )
-        {
-            $conn->print( $response->content );
-        }
+        $conn->print( $response->content )
+          if defined $req->uri->scheme
+             and $req->uri->scheme =~ /^(?:ftp|gopher)$/
+             and $response->is_success;
 
-        $self->log( SOCKET, "($$) Connection closed by the proxy" ), last
+        $self->log( SOCKET, "SOCKET", "Connection closed by the proxy" ), last
           if $last || $served >= $self->maxserve;
     }
-    $self->log( SOCKET, "($$) Connection closed by the client" )
+    $self->log( SOCKET, "SOCKET", "Connection closed by the client" )
       if !$last
       and $served < $self->maxserve;
-    $self->log( PROCESS, "($$) Served $served requests" );
+    $self->log( PROCESS, "PROCESS", "Served $served requests" );
     $conn->close;
 }
 
@@ -657,6 +680,7 @@ sub _send_response_headers {
 
     # correct headers
     $response->remove_header("Content-Length");
+        # FIXME don't remove if no body filter
     $response->header( Server => "HTTP::Proxy/$VERSION" )
       unless $response->header( 'Server' );
     $response->header( Date => time2str(time) )
@@ -692,8 +716,8 @@ sub _send_response_headers {
         print $conn $response->headers_as_string($CRLF);
         print $conn $CRLF;    # separates headers and content
     }
-    $self->log( STATUS,  "($$) Response:", $response->status_line );
-    $self->log( HEADERS, "($$) Response:", $response->headers->as_string );
+    $self->log( STATUS,  "RESPONSE", $response->status_line );
+    $self->log( HEADERS, "RESPONSE", $response->headers->as_string );
     return ($last, $chunked);
 }
 
@@ -744,7 +768,7 @@ sub _handle_CONNECT {
           
             # check for errors
             if(not defined $read ) {
-                $self->log( ERROR, "($$) CONNECT:", "Read undef from $from ($!)" );
+                $self->log( ERROR, "CONNECT", "Read undef from $from ($!)" );
                 next;
             }
 
@@ -752,18 +776,17 @@ sub _handle_CONNECT {
             if ( $read == 0 ) {
                 $_->close for ( $sock, $peer );
                 $select->remove( $sock, $peer );
-                $self->log( SOCKET, "($$) CONNECT:", "Connection closed by the $from" );
-                $self->log( PROCESS, "($$) Served $served requests" );
+                $self->log( SOCKET, "CONNECT", "Connection closed by the $from" );
+                $self->log( PROCESS, "PROCESS", "Served $served requests" );
                 next;
             }
 
             # proxy the data
-            $self->log( CONNECT, "($$) CONNECT:",
-                                 "$read bytes received from $from" );
-            $peer->syswrite($data);
+            $self->log( CONNECT, "CONNECT", "$read bytes received from $from" );
+            $peer->syswrite($data, length $data);
         }
     }
-    $self->log( CONNECT, "($$) CONNECT:", "End of CONNECT proxyfication");
+    $self->log( CONNECT, "CONNECT", "End of CONNECT proxyfication");
     return $last;
 }
 
@@ -987,10 +1010,12 @@ The log() method also prints a timestamp.
 
 The output looks like:
 
-    [Thu Dec  5 12:30:12 2002] $prefix $message
+    [Thu Dec  5 12:30:12 2002] ($$) $prefix: $message
+
+where $$ is the current processus pid.
 
 If $message is a multiline string, several log lines will be output,
-each starting with $prefix.
+each line starting with C<$prefix>.
 
 =cut
 
@@ -1006,7 +1031,7 @@ sub log {
     @lines = ('') if not @lines;
 
     flock( $fh, LOCK_EX );
-    print $fh "[" . localtime() . "] $prefix $_\n" for @lines;
+    print $fh "[" . localtime() . "] ($$) $prefix: $_\n" for @lines;
     flock( $fh, LOCK_UN );
 }
 
@@ -1041,7 +1066,7 @@ work on WinXP ActiveState Perl 5.8.
 
 =head1 SEE ALSO
 
-L<Proxy::BodyFilter>, L<Proxy::HeaderFilter>, the examples in eg/.
+L<HTTP::Proxy::BodyFilter>, L<HTTP::Proxy::HeaderFilter>, the examples in eg/.
 
 =head1 AUTHOR
 
@@ -1157,8 +1182,14 @@ sub filter {
             $self->{buffers} = [ \( @{ $self->{buffers} } ) ];
         }
 
-        # start the filter if needed
-        for ( @{ $self->{current} } ) { $_->start if $_->can('start'); }
+        # start the filter if needed (and pass the message)
+        for ( @{ $self->{current} } ) {
+            if    ( $_->can('begin') ) { $_->begin( $_[1] ); }
+            elsif ( $_->can('start') ) {
+                $_->proxy->log( HTTP::Proxy::ERROR, "DEPRECATION", "The start() filter method is *deprecated* and will go away in 0.15!\nStart s/start/begin/g in your filters!" );
+                $_->start( $_[1] );
+            }
+        }
     }
 
     # pass the body data through the filter
@@ -1192,6 +1223,9 @@ sub filter_last {
         $_->filter( $data, $message, $protocol, undef );
     }
 
+    # call the cleanup routine if needed
+    for ( @{ $self->{current} } ) { $_->end if $_->can('end'); }
+    
     # clean up the mess for next time
     $self->eod;
 }

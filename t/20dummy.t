@@ -1,16 +1,19 @@
+use Test::More;
 use strict;
-use vars qw( @requests );
 
 # here are all the requests the client will try
-BEGIN {
-    @requests = qw(
-      file1.txt
-      directory/file2.txt
-      ooh.cgi?q=query
-    );
+my @requests = qw(
+    file1.txt
+    directory/file2.txt
+    ooh.cgi?q=query
+);
+
+if( $^O eq 'MSWin32' ) {
+    plan skip_all => "This test fails on MSWin32. HTTP::Proxy is usable on Win32 with maxchild => 0";
+    exit;
 }
 
-use Test::More tests => 3 * @requests + 1;
+plan tests => 3 * @requests + 1;
 
 use LWP::UserAgent;
 use HTTP::Proxy;
@@ -24,10 +27,12 @@ $test->no_ending(1);
 
 # create a HTTP::Daemon (on an available port)
 my $server = server_start();
+my $serverurl = $server->url;
 
 my $proxy = HTTP::Proxy->new( port => 0, maxconn => scalar @requests );
 $proxy->init;    # required to access the url later
 $proxy->agent->no_proxy( URI->new( $server->url )->host );
+my $proxyurl = $proxy->url;
 
 # fork the HTTP server
 my @pids;
@@ -72,10 +77,10 @@ push @pids, $pid;    # remember the kid
 
 # run a client
 my $ua = LWP::UserAgent->new;
-$ua->proxy( http => $proxy->url );
+$ua->proxy( http => $proxyurl );
 
 for (@requests) {
-    my $req = HTTP::Request->new( GET => $server->url . $_ );
+    my $req = HTTP::Request->new( GET => $serverurl . $_ );
     my $rep = $ua->simple_request($req);
     ok( $rep->is_success, "Got an answer (@{[$rep->status_line]})" );
     my $re = quotemeta;

@@ -2,6 +2,26 @@ package HTTP::Proxy::BodyFilter;
 
 use Carp;
 
+sub new {
+    my $class = shift;
+    my $self = bless {}, $class;
+    $self->init(@_) if $self->can('init');
+    return $self;
+}
+
+sub proxy {
+    my ( $self, $new ) = @_;
+    return $new ? $self->{_hpbf_proxy} = $new : $self->{_hpbf_proxy};
+}
+
+sub filter {
+    croak "HTTP::Proxy::HeaderFilter cannot be used as a filter";
+}
+
+1;
+
+__END__
+
 =head1 NAME
 
 HTTP::Proxy::BodyFilter - A base class for HTTP messages body filters
@@ -25,19 +45,15 @@ HTTP::Proxy::BodyFilter - A base class for HTTP messages body filters
 The HTTP::Proxy::BodyFilter class is used to create filters for
 HTTP request/response body data.
 
-=cut
-
-sub new {
-    my $class = shift;
-    my $self = bless {}, $class;
-    $self->init(@_) if $self->can('init');
-    return $self;
-}
-
 =head2 Creating a BodyFilter
 
-A BodyFilter is just a derived class that implements the filter()
-method. See the example in L<SYNOPSIS>.
+A BodyFilter is just a derived class that implements some methods
+called by the proxy. Of all the methods presented below, only
+C<filter()> B<must> be defined in the derived class.
+
+=over 4
+
+=item filter()
 
 The signature of the filter() method is the following:
 
@@ -56,7 +72,7 @@ backs of LWP::UserAgent (except that $message is either a HTTP::Request
 or a HTTP::Response object).
 
 $buffer is a reference to a buffer where some of the unprocessed data
-can be stored for the next time the filter will be called (see L<Using
+can be stored for the next time the filter will be called (see L</Using
 a buffer to store data for a later use> for details). Thanks to the
 built-in HTTP::Proxy::BodyFilter::* filters, this is rarely needed.
 
@@ -71,6 +87,42 @@ filters that follows, until the data reaches its recipient.
 
 A HTTP::Proxy::BodyFilter object is a blessed hash, and the base class
 reserves only hash keys that start with C<_hpbf>.
+
+=item init()
+
+This method is called by the C<new()> constructeur to perform all
+initisalisation tasks. It's called once in the filter lifetime.
+
+It receives all the parameters passed to C<new()>.
+
+=item begin()
+
+Some filters might require initialisation before they are able to handle
+the data. If a C<begin()> method is defined in your subclass, the proxy
+will call it before sending data to the C<filter()> method.
+
+It's called once per HTTP message handled by the filter, before data
+processing begins.
+
+The method signature is as follows:
+
+    sub begin {
+        my ( $self, $message ) = @_
+        ...
+    }
+
+=item end()
+
+Some filters might require finalisation after they are finished handling
+the data. If a C<end()> method is defined in your subclass, the proxy
+will call it after it has finished sending data to the C<filter()> method.
+
+It's called once per HTTP message handled by the filter, after all data
+processing is done.
+
+This method does not expect any parameters.
+
+=back
 
 =head2 Using a buffer to store data for a later use
 
@@ -91,7 +143,8 @@ store any data, because this is the very last run, needed to gather
 all the data left in all buffers.
 
 It is recommended to store as little data as possible in the buffer,
-so as to avoid (badly) reproducing the store and forward mechanism.
+so as to avoid (badly) reproducing what HTTP::Proxy::BodyFilter::complete
+does.
 
 In particular, you have to remember that all the data that remains in
 the buffer after the last piece of data is received from the origin
@@ -99,15 +152,12 @@ server will be sent back to your filter in one big piece.
 
 =head2 The store and forward approach
 
-HTTP::Proxy will implement a I<store and forward> mechanism, for those
-filters who needs to have the whole (response) message body to
-work. It's simply enabled by pushing the HTTP::Proxy::BodyFilter::store
-filter on the filter stack.
+HTTP::Proxy implements a I<store and forward> mechanism, for those filters
+which need to have the whole message body to work. It's enabled simply by
+pushing the HTTP::Proxy::BodyFilter::complete filter on the filter stack.
 
-The interface is not fully defined yet.
-
-In the store and forward mechanism, $headers is I<still> modifiable by
-the filter, and the modified headers will be sent to the client or server.
+The data is stored in memory by the "complete" filter, which passes it
+on to the following filter once the full message body has been received.
 
 =head2 Standard BodyFilters
 
@@ -127,7 +177,7 @@ piece of data for the current HTTP message body.
 =item htmltext
 
 This class lets you create a filter that runs a given code reference
-against text  included in a HTML document (outside C<E<lt>scriptE<gt>>
+against text included in a HTML document (outside C<E<lt>scriptE<gt>>
 and C<E<lt>styleE<gt>> tags). HTML entities are not included in the text.
 
 =item htmlparser
@@ -138,13 +188,15 @@ Creates a filter from a HTML::Parser object.
 
 This class lets you create a simple body filter from a code reference.
 
-=item store (TODO)
+=item save
 
-This filter stores the page in a temporary file, thus allowing
+Store the message body to a file.
+
+=item complete
+
+This filter stores the whole message body in memory, thus allowing
 some actions to be taken only when the full page has been received
 by the proxy.
-
-The interface is not completely defined yet.
 
 =item tags
 
@@ -156,13 +208,7 @@ implementation is not 100% perfect, though.
 
 Please read each filter's documentation for more details about their use.
 
-=cut
-
-sub filter {
-    croak "HTTP::Proxy::HeaderFilter cannot be used as a filter";
-}
-
-=head1 AVAILABLE METHODS
+=head1 USEFUL METHODS FOR SUBCLASSES
 
 Some methods are available to filters, so that they can eventually use
 the little knowledge they might have of HTTP::Proxy's internals. They
@@ -174,13 +220,6 @@ mostly are accessors.
 
 Gets a reference to the HTTP::Proxy objects that owns the filter.
 This gives access to some of the proxy methods.
-
-=cut
-
-sub proxy {
-    my ( $self, $new ) = @_;
-    return $new ? $self->{_hpbf_proxy} = $new : $self->{_hpbf_proxy};
-}
 
 =back
 
@@ -194,7 +233,7 @@ HTTP::Proxy, HTTP::Proxy::HeaderFilter.
 
 =head1 COPYRIGHT
 
-Copyright 2003-2004, Philippe Bruhat
+Copyright 2003-2005, Philippe Bruhat
 
 =head1 LICENSE
 
@@ -203,4 +242,3 @@ the same terms as Perl itself.
 
 =cut
 
-1;

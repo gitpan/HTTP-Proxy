@@ -1,5 +1,8 @@
 The eg/ directory holds a few example proxies.
 
+All scripts accept HTTP::Proxy constructor key/value pairs on the
+command-line. Example: ./proxy.pl port 3128 host 0.0.0.0
+
  * proxy.pl
 
    A very simple proxy.
@@ -30,10 +33,16 @@ The eg/ directory holds a few example proxies.
             HTTP::Proxy::BodyFilter::simple
             HTTP::Proxy::BodyFilter::htmltext
 
+ * bork.pl
+
+   This ffiltir elsu duis simpli mudiffixeshuns uff ell HTML pegis.
+   Bork bork bork ! 
+
  * outline.pl
+ * ayb.pl
 
    These proxy do more complicated modifications of HTML pages, and
-   require a HTML::Parser object to do so.
+   require a HTML::Parser object to do so. All you tag are belong to us.
 
    Filter: HTTP::Proxy::BodyFilter::htmlparser
 
@@ -71,3 +80,18 @@ The eg/ directory holds a few example proxies.
 
    Filter: HTTP::Proxy::BodyFilter::htmlparser
 
+ * rfc.pl
+
+   A proxy that automatically saves the files named rfc\d+\.txt to
+   a file of the same name in the rfc/ directory.
+
+   Filter: HTTP::Proxy::BodyFilter::save
+
+ * dragon.pl
+
+   A proxy that removes some of the shortcomings of the Dragon Go
+   Server website (http://www.dragongoserver.net/)
+
+   Filter: HTTP::Proxy::HeaderFilter::simple
+           HTTP::Proxy::BodyFilter::simple
+           HTTP::Proxy::BodyFilter::tags
