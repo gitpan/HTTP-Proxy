@@ -5,10 +5,10 @@ use HTTP::Date qw(time2str);
 use LWP::UserAgent;
 use LWP::ConnCache;
 use Fcntl ':flock';         # import LOCK_* constants
-use POSIX ":sys_wait_h";    # WNOHANG
 use IO::Select;
 use Sys::Hostname;          # hostname()
 use Carp;
+use HTTP::Proxy::Engine;
 
 use strict;
 use vars qw( $VERSION $AUTOLOAD @METHODS
@@ -20,7 +20,7 @@ require Exporter;
 @EXPORT_OK = qw( NONE ERROR STATUS PROCESS SOCKET HEADERS FILTERS CONNECT ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = '0.15';
+$VERSION = '0.16';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
 
@@ -30,19 +30,22 @@ use HTTP::Proxy::HeaderFilter::standard;
 # constants used for logging
 use constant ERROR   => -1;    # always log
 use constant NONE    => 0;     # never log
-use constant STATUS  => 1;     # HTTP status
-use constant PROCESS => 2;     # sub-process life (and death)
-use constant SOCKET  => 4;     # low-level connections
-use constant HEADERS => 8;     # HTTP headers
-use constant FILTERS => 16;    # Messages from filters
-use constant DATA    => 32;    # Data received by the filters
-use constant CONNECT => 64;    # Data transmitted by the CONNECT method
-use constant ALL     => 127;   # All of the above
+use constant PROXY   => 1;     # proxy information
+use constant STATUS  => 2;     # HTTP status
+use constant PROCESS => 4;     # sub-process life (and death)
+use constant SOCKET  => 8;     # low-level connections
+use constant HEADERS => 16;    # HTTP headers
+use constant FILTERS => 32;    # Messages from filters
+use constant DATA    => 64;    # Data received by the filters
+use constant CONNECT => 128;   # Data transmitted by the CONNECT method
+use constant ALL     => 255;   # All of the above
 
 # Methods we can forward
 @METHODS = (
     qw( OPTIONS GET HEAD POST PUT DELETE TRACE CONNECT ), # HTTP
-    qw( PROPFIND COPY MOVE ),                             # WEBDAV
+    qw( COPY MOVE PROPFIND PROPPATCH LOCK UNLOCK MKCOL ), # WebDAV
+    qw( VERSION-CONTROL MKWORKSPACE CHECKOUT CHECKIN
+        MKACTIVITY UPDATE REPORT ),                       # DeltaV
 );
 
 # useful regexes (from RFC 2616 BNF grammar)
@@ -53,29 +56,51 @@ $RX{method} = '(?:' . join ( '|', @METHODS ) . ')';
 $RX{method} = qr/$RX{method}/;
 
 sub new {
-    my $class = shift;
+    my $class  = shift;
+    my %params = @_;
 
     # some defaults
-    my $self = {
+    my %defaults = (
         agent    => undef,
         chunk    => 4096,
         daemon   => undef,
         host     => 'localhost',
         logfh    => *STDERR,
         logmask  => NONE,
-        maxchild => 10,
-        maxconn  => 0,
-        maxserve => 10,
+        max_connections => 0,
+        max_keep_alive_requests => 10,
         port     => 8080,
+        stash    => {},
         timeout  => 60,
         via      => hostname() . " (HTTP::Proxy/$VERSION)",
         x_forwarded_for => 1,
-        @_,
-    };
+    );
 
     # non modifiable defaults
-    %$self = ( %$self, conn => 0, loop => 1 );
-    bless $self, $class;
+    my $self = bless { conn => 0, loop => 1 }, $class;
+
+    # support for deprecated stuff
+    {
+        my %convert = (
+            maxchild => 'max_clients',
+            maxconn  => 'max_connections',
+            maxserve => 'max_keep_alive_requests',
+        );
+        while( my ($old, $new) = each %convert ) {
+            if( exists $params{$old} ) {
+               $params{$new} = delete $params{$old};
+               carp "$old is deprecated, please use $new";
+            }
+        }
+    }
+
+    # get attributes
+    $self->{$_} = exists $params{$_} ? delete( $params{$_} ) : $defaults{$_}
+      for keys %defaults;
+
+    # choose an engine with the remaining parameters
+    $self->{engine} = HTTP::Proxy::Engine->new( %params, proxy => $self );
+    $self->log( PROXY, "PROXY", "Selected engine " . ref $self->{engine} );
 
     return $self;
 }
@@ -100,9 +125,11 @@ sub url {
 }
 
 # normal accessors
-for my $attr (
-    qw( agent chunk daemon host logfh maxchild maxconn maxserve port
-    request response hop_headers logmask via x_forwarded_for client_headers )
+for my $attr ( qw(
+    agent chunk daemon host logfh port request response hop_headers
+    logmask via x_forwarded_for client_headers engine
+    max_connections max_keep_alive_requests
+    )
   )
 {
     no strict 'refs';
@@ -117,96 +144,55 @@ for my $attr (
 # read-only accessors
 for my $attr (qw( conn loop client_socket )) {
     no strict 'refs';
-    *{"HTTP::Proxy::$attr"} = sub { return $_[0]->{$attr} }
+    *{"HTTP::Proxy::$attr"} = sub { $_[0]{$attr} }
 }
+
+sub max_clients { shift->engine->max_clients( @_ ) }
+
+# deprecated methods are still supported
+{
+    my %convert = (
+        maxchild => 'max_clients',
+        maxconn  => 'max_connections',
+        maxserve => 'max_keep_alive_requests',
+    );
+    while ( my ( $old, $new ) = each %convert ) {
+        no strict 'refs';
+        *$old = sub {
+            carp "$old is deprecated, please use $new";
+            goto \&$new;
+        };
+    }
+}
+
+sub stash {
+    my $stash = shift->{stash};
+    return $stash unless @_;
+    return $stash->{ $_[0] } if @_ == 1;
+    return $stash->{ $_[0] } = $_[1];
+}
+
+sub new_connection { ++$_[0]{conn} }
 
 sub start {
     my $self = shift;
-    my @kids;
 
-    # some initialisation
     $self->init;
     $SIG{INT} = $SIG{KILL} = sub { $self->{loop} = 0 };
 
     # the main loop
-    my $select = IO::Select->new( $self->daemon );
-    while ( $self->loop ) {
-
-        # check for new connections
-        my @ready = $select->can_read(1);
-        for my $fh (@ready) {    # there's only one, anyway
-
-            # single-process proxy (useful for debugging)
-            if ( $self->maxchild == 0 ) {
-                $self->maxserve(1);    # do not block simultaneous connections
-                $self->log( PROCESS, "PROCESS",
-                            "No fork allowed, serving the connection" );
-                $self->serve_connections($fh->accept);
-                $self->{conn}++;    # read-only attribute
-                next;
-            }
-
-            if ( @kids >= $self->maxchild ) {
-                $self->log( ERROR, "PROCESS",
-                            "Too many child process, serving the connection" );
-                $self->serve_connections($fh->accept);
-                $self->{conn}++;    # read-only attribute
-                next;
-            }
-
-            # accept the new connection
-            my $conn  = $fh->accept;
-            my $child = fork;
-            if ( !defined $child ) {
-                $conn->close;
-                $self->log( ERROR, "PROCESS", "Cannot fork" );
-                $self->maxchild( $self->maxchild - 1 )
-                  if $self->maxchild > @kids;
-                next;
-            }
-
-            # the parent process
-            if ($child) {
-                $conn->close;
-                $self->log( PROCESS, "PROCESS", "Forked child process $child" );
-                push @kids, $child;
-            }
-
-            # the child process handles the whole connection
-            else {
-                $SIG{INT} = 'DEFAULT';
-                $fh->close;
-                $self->serve_connections($conn);
-                exit;    # let's die!
-            }
-        }
-
-        # handle zombies
-        $self->_reap( \@kids ) if @kids;
-
-        # this was the last child we forked
-        last if $self->maxconn && $self->conn >= $self->maxconn;
+    my $engine = $self->engine;
+    $engine->start if $engine->can('start');
+    while( $self->loop ) {
+        $engine->run;
+        last if $self->max_connections && $self->conn >= $self->max_connections;
     }
+    $engine->stop if $engine->can('stop');
 
-    # wait for remaining children
-    kill INT => @kids;
-    $self->_reap( \@kids ) while @kids;
+    $self->log( STATUS, "STATUS",
+        "Processed " . $self->conn . " connection(s)" );
 
-    $self->log( STATUS, "STATUS", "Processed " . $self->conn . " connection(s)" );
     return $self->conn;
-}
-
-# private reaper sub
-sub _reap {
-    my ( $self, $kids ) = @_;
-    while (1) {
-        my $pid = waitpid( -1, &WNOHANG );
-        last if $pid == 0 || $pid == -1;    # AS/Win32 returns negative PIDs
-        @$kids = grep { $_ != $pid } @$kids;
-        $self->{conn}++;    # Cannot use the interface for RO attributes
-        $self->log( PROCESS, "PROCESS", "Reaped child process $pid" );
-        $self->log( PROCESS, "PROCESS", "Remaining kids: @$kids" );
-    }
 }
 
 # semi-private init method
@@ -326,7 +312,7 @@ sub serve_connections {
         }
 
         # can we serve this protocol?
-        if ( !$self->agent->is_protocol_supported( my $s = $req->uri->scheme ) )
+        if ( !$self->is_protocol_supported( my $s = $req->uri->scheme ) )
         {
             # should this be 400 Bad Request?
             $response = HTTP::Response->new( 501, 'Not Implemented' );
@@ -358,6 +344,8 @@ sub serve_connections {
         # we won't contact the origin server
         # FIXME should the response header and body be filtered?
         goto SEND if defined $self->response;
+
+        # FIXME - don't forward requests to ourselves!
 
         # pop a response
         my ( $sent, $chunked ) = ( 0, 0 );
@@ -439,6 +427,8 @@ sub serve_connections {
         # (empty body or error)
         # FIXME some error response headers might not be filtered
         if ( !$sent ) {
+            $self->{$_}{response}->select_filters( $response )
+              for qw( headers body );
             ($last, $chunked) = $self->_send_response_headers( $served );
             my $content = $response->content;
             if ($chunked) {
@@ -456,11 +446,11 @@ sub serve_connections {
              and $response->is_success;
 
         $self->log( SOCKET, "SOCKET", "Connection closed by the proxy" ), last
-          if $last || $served >= $self->maxserve;
+          if $last || $served >= $self->max_keep_alive_requests;
     }
     $self->log( SOCKET, "SOCKET", "Connection closed by the client" )
       if !$last
-      and $served < $self->maxserve;
+      and $served < $self->max_keep_alive_requests;
     $self->log( PROCESS, "PROCESS", "Served $served requests" );
     $conn->close;
 }
@@ -476,8 +466,8 @@ sub _send_response_headers {
     my $response = $self->response;
 
     # correct headers
-    $response->remove_header("Content-Length");
-        # FIXME don't remove if no body filter
+    $response->remove_header("Content-Length")
+      if $self->{body}{response}->active;
     $response->header( Server => "HTTP::Proxy/$VERSION" )
       unless $response->header( 'Server' );
     $response->header( Date => time2str(time) )
@@ -503,7 +493,7 @@ sub _send_response_headers {
                 $chunked++;
                 $response->push_header( "Transfer-Encoding" => "chunked" );
                 $response->push_header( "Connection"        => "close" )
-                  if $served >= $self->maxserve;
+                  if $served >= $self->max_keep_alive_requests;
             }
             else {
                 $last++;
@@ -540,6 +530,8 @@ sub _handle_CONNECT {
     # send the response headers (FIXME more headers required?)
     my $response = HTTP::Response->new(200);
     $self->response($response);
+    $self->{$_}{response}->select_filters( $response ) for qw( headers body );
+
     $self->_send_response_headers( $served );
 
     # we now have a TCP connection
@@ -600,7 +592,7 @@ sub push_filter {
 
     # parse parameters
     for( my $i = 0; $i < @_ ; $i += 2 ) {
-        next if $_[$i] !~ /^(mime|method|scheme|host|path)$/;
+        next if $_[$i] !~ /^(mime|method|scheme|host|path|query)$/;
         $arg{$_[$i]} = $_[$i+1];
         splice @_, $i, 2;
         $i -= 2;
@@ -628,7 +620,7 @@ sub push_filter {
     my @scheme = split /\s*,\s*/, $scheme;
     for (@scheme) {
         croak "Unsupported scheme: $_"
-          if !$self->agent->is_protocol_supported($_);
+          if !$self->is_protocol_supported($_);
     }
     $scheme = @scheme ? '(?:' . join ( '|', @scheme ) . ')' : '';
     $scheme = qr/$scheme/;
@@ -674,6 +666,19 @@ sub push_filter {
         $self->{$stack}{$message}->push( [ $match, $filter ] );
         $filter->proxy( $self );
     }
+}
+
+sub is_protocol_supported {
+    my ( $self, $scheme ) = @_;
+    my $ok = 1;
+    if ( !$self->agent->is_protocol_supported($scheme) ) {
+
+        # double check, in case a dummy scheme was added
+        # to be handled directly by a filter
+        $ok = 0;
+        $scheme eq $_ && $ok++ for @{ $self->agent->protocols_allowed };
+    }
+    $ok;
 }
 
 sub log {
@@ -855,10 +860,6 @@ HTTP::Proxy - A pure Perl HTTP proxy
     my $proxy = HTTP::Proxy->new;
     $proxy->port( 3128 ); # the classical accessors are here!
 
-    # you can also use your own UserAgent
-    my $agent = LWP::RobotUA->new;
-    $proxy->agent( $agent );
-
     # this is a MainLoop-like method
     $proxy->start;
 
@@ -870,23 +871,169 @@ client connections, and a LWP::UserAgent to ask for the requested pages.
 The most interesting feature of this proxy object is its ability to
 filter the HTTP requests and responses through user-defined filters.
 
+Once the proxy is created, with the C<new()> method, it is possible
+to alter its behaviour by adding so-called "filters". This is
+done by the C<push_filter()> method. Once the filter is ready to
+run, it can be launched, with the C<start()> method. This method
+does not normally return until the proxy is killed or otherwise
+stopped.
+
+An important thing to note is that the proxy is (except when running
+the C<NoFork> engine) a I<forking> proxy: it doesn't support passing
+information between child processes, and you can count on reliable
+information passing only during a single HTTP connection (request +
+response).
+
+=head1 FILTERS
+
+You can alter the way the default HTTP::Proxy works by plugging callbacks
+(filter objects, actually) at different stages of the request/response
+handling.
+
+When a request is received by the HTTP::Proxy object, it is filtered through
+a standard filter that transform this request accordingly to RFC 2616
+(by adding the C<Via:> header, and a few other transformations). This is
+the default, bare minimum behaviour.
+
+The response is also filtered in the same manner. There is a total of four
+filter chains: C<request-headers>, C<request-body>, C<reponse-headers> and
+C<response-body>.
+
+You can add your own filters to the default ones with the
+C<push_filter()> method. The method pushes a filter on the appropriate
+filter stack.
+
+    $proxy->push_filter( response => $filter );
+
+The headers/body category is determined by the base class of the filter.
+There are two base classes for filters, which are
+C<HTTP::Proxy::HeaderFilter> and C<HTTP::Proxy::BodyFilter> (the names
+are self-explanatory). See the documentation of those two classes
+to find out how to write your own header or body filters.
+
+The named parameter is used to determine the request/response part.
+
+It is possible to push the same filter on the request and response
+stacks, as in the following example:
+
+    $proxy->push_filter( request => $filter, response => $filter );
+
+If several filters match the message, they will be applied in the order
+they were pushed on their filter stack.
+
+Named parameters can be used to create the match routine. They are: 
+
+    method - the request method
+    scheme - the URI scheme         
+    host   - the URI authority (host:port)
+    path   - the URI path
+    query  - the URI query string
+    mime   - the MIME type (for a response-body filter)
+
+The filters are applied only when all the the parameters match the
+request or the response. All these named parameters have default values,
+which are:
+
+    method => 'OPTIONS,GET,HEAD,POST,PUT,DELETE,TRACE,CONNECT'
+    scheme => 'http'
+    host   => ''
+    path   => ''
+    query  => ''
+    mime   => 'text/*'
+
+The C<mime> parameter is a glob-like string, with a required C</>
+character and a C<*> as a joker. Thus, C<*/*> matches I<all> responses,
+and C<""> those with no C<Content-Type:> header. To match any
+reponse (with or without a C<Content-Type:> header), use C<undef>.
+
+The C<mime> parameter is only meaningful with the C<response-body>
+filter stack. It is ignored if passed to any other filter stack.
+
+The C<method> and C<scheme> parameters are strings consisting of
+comma-separated values. The C<host> and C<path> parameters are regular
+expressions.
+
+A match routine is compiled by the proxy and used to check if a particular
+request or response must be filtered through a particular filter.
+
+It is also possible to push several filters on the same stack with
+the same match subroutine:
+
+    # convert italics to bold
+    $proxy->push_filter(
+        mime     => 'text/html',
+        response => HTTP::Proxy::BodyFilter::tags->new(),
+        response =>
+          HTTP::Proxy::BodyFilter::simple->new( sub { s!(</?)i>!$1b>!ig } )
+    );
+
+For more details regarding the creation of new filters, check the
+C<HTTP::Proxy::HeaderFilter> and C<HTTP::Proxy::BodyFilter> documentation.
+
+Here's an example of subclassing a base filter class:
+
+    # fixes a common typo ;-)
+    # but chances are that this will modify a correct URL
+    {
+        package FilterPerl;
+        use base qw( HTTP::Proxy::BodyFilter );
+
+        sub filter {
+            my ( $self, $dataref, $message, $protocol, $buffer ) = @_;
+            $$dataref =~ s/PERL/Perl/g;
+        }
+    }
+    $proxy->push_filter( response => FilterPerl->new() );
+
+Other examples can be found in the documentation for
+C<HTTP::Proxy::HeaderFilter>, C<HTTP::Proxy::BodyFilter>,
+C<HTTP::Proxy::HeaderFilter::simple>, C<HTTP::Proxy::BodyFilter::simple>.
+
+    # a simple anonymiser
+    # see eg/anonymiser.pl for the complete code
+    $proxy->push_filter(
+        mime    => undef,
+        request => HTTP::Proxy::HeaderFilter::simple->new(
+            sub { $_[0]->remove_header(qw( User-Agent From Referer Cookie )) },
+        ),
+        response => HTTP::Proxy::HeaderFilter::simple->new(
+            sub { $_[0]->remove_header(qw( Set-Cookie )); },
+        )
+    );
+
+IMPORTANT: If you use your own C<LWP::UserAgent>, you must install it
+before your calls to C<push_filter()>, otherwise
+the match method will make wrong assumptions about the schemes your
+agent supports.
+
+NOTE: It is likely that possibility of changing the agent or the daemon
+may disappear in future versions.
+
 =head1 METHODS
 
-=head2 Constructor and initilisation
+=head2 Constructor and initialisation
 
 =over 4
 
 =item new()
 
-The new() method creates a HTTP::Proxy object. All attributes can
-be passed as a parameter to replace the default.
+The C<new()> method creates a new HTTP::Proxy object. All attributes can
+be passed as parameters to replace the default.
+
+Parameters that are not C<HTTP::Proxy> attributes will be ignored and
+passed to the chosen C<HTTP::Proxy::Engine> object.
 
 =item init()
 
-init() initialise the proxy without starting it. It is usually not
+C<init()> initialise the proxy without starting it. It is usually not
 needed.
 
-This method is called by start() if needed.
+This method is called by C<start()> if needed.
+
+=item push_filter()
+
+The C<push_filter()> method is used to add filters to the proxy.
+It is fully described in section L<FILTERS>.
 
 =back
 
@@ -942,6 +1089,10 @@ The number of connections processed by this HTTP::Proxy instance.
 The HTTP::Daemon object used to accept incoming connections.
 (You usually never need this.)
 
+=item engine
+
+The HTTP::Proxy::Engine object that manages the child processes.
+
 =item hop_headers
 
 This attribute holds a reference to the hop-by-hop headers
@@ -973,17 +1124,20 @@ A filehandle to a logfile (default: *STDERR).
 
 Be verbose in the logs (default: NONE).
 
-Here are the various elements that can be added to the mask:
- NONE    - Log only errors
- STATUS  - Requested URL, reponse status and total number
-           of connections processed
- PROCESS - Subprocesses information (fork, wait, etc.)
- SOCKET  - Information about low-level sockets
- HEADERS - Full request and response headers are sent along
- FILTERS - Filter information
- DATA    - Data received by the filters
- CONNECT - Data transmitted by the CONNECT method
- ALL     - Log all of the above
+Here are the various elements that can be added to the mask (their values
+are powers of 2, starting from 0 and listed here in ascending order):
+
+    NONE    - Log only errors
+    PROXY   - Proxy information
+    STATUS  - Requested URL, reponse status and total number
+              of connections processed
+    PROCESS - Subprocesses information (fork, wait, etc.)
+    SOCKET  - Information about low-level sockets
+    HEADERS - Full request and response headers are sent along
+    FILTERS - Filter information
+    DATA    - Data received by the filters
+    CONNECT - Data transmitted by the CONNECT method
+    ALL     - Log all of the above
 
 If you only want status and process information, you can use:
 
@@ -996,13 +1150,18 @@ by the C<:log> tag. They can also be exported one by one.
 
 Internal. False when the main loop is about to be broken.
 
+=item max_clients
+
 =item maxchild
 
 The maximum number of child process the HTTP::Proxy object will spawn
-to handle client requests (default: 16).
+to handle client requests (default: depends on the engine).
 
-If set to 0, the proxy will not fork at all. This can be helpful for
-debugging purpose.
+This method is currently delegated to the HTTP::Proxy::Engine object.
+
+C<maxchild> is deprecated and will disappear.
+
+=item max_connections
 
 =item maxconn
 
@@ -1010,14 +1169,24 @@ The maximum number of TCP connections the proxy will accept before
 returning from start(). 0 (the default) means never stop accepting
 connections.
 
+C<maxconn> is deprecated.
+
+Note: C<max_connections> will be deprecated soon, for two reasons: 1)
+it is more of an HTTP::Proxy::Engine attribute, 2) not all engines will
+support it.
+
+=item max_keep_alive_requests
+
 =item maxserve
 
 The maximum number of requests the proxy will serve in a single connection.
-(same as MaxRequestsPerChild in Apache)
+(same as C<MaxRequestsPerChild> in Apache)
+
+C<maxserve> is deprecated.
 
 =item port
 
-The proxy HTTP::Daemon port (default: 8080).
+The proxy C<HTTP::Daemon> port (default: 8080).
 
 =item request
 
@@ -1036,6 +1205,29 @@ the request/response scheme, and the proxy will return this response
 the expected origin server response. This is useful for caching (though
 Squid does it much better) and proxy authentication, for example.
 
+=item stash
+
+The stash is a hash where filters can store data to share between them.
+
+The stash() method can be used to set the whole hash (with a HASH reference).
+To access individual keys simply do:
+
+    $proxy->stash( 'bloop' );
+
+To set it, type:
+
+    $proxy->stash( bloop => 'owww' );
+
+It's also possibly to get a reference to the stash:
+
+    my $s = $filter->proxy->stash();
+    $s->{bang} = 'bam';
+
+    # $proxy->stash( 'bang' ) will now return 'bam'
+
+B<Warning:> since the proxy forks for each TCP connection, the data is
+only shared between filters in the same child process.
+
 =item timeout
 
 The timeout used by the internal LWP::UserAgent (default: 60).
@@ -1047,11 +1239,11 @@ The url where the proxy can be reached.
 =item via
 
 The content of the Via: header. Setting it to an empty string will
-prevent its addition. (default: $hostname (HTTP::Proxy/$VERSION))
+prevent its addition. (default: C<$hostname (HTTP::Proxy/$VERSION)>)
 
 =item x_forwarded_for
 
-If set to a true value, the proxy will send the X-Forwarded-For header.
+If set to a true value, the proxy will send the C<X-Forwarded-For:> header.
 (default: true)
 
 =back
@@ -1063,9 +1255,9 @@ If set to a true value, the proxy will send the X-Forwarded-For header.
 =item start()
 
 This method works like Tk's C<MainLoop>: you hand over control to the
-HTTP::Proxy object you created and configured.
+C<HTTP::Proxy> object you created and configured.
 
-If C<maxconn> is not zero, start() will return after accepting
+If C<maxconn> is not zero, C<start()> will return after accepting
 at most that many connections. It will return the total number of
 connexions.
 
@@ -1076,145 +1268,93 @@ to the proxy.
 
 =back
 
-=head1 FILTERS
-
-You can alter the way the default HTTP::Proxy works by pluging callbacks
-at different stages of the request/response handling.
-
-When a request is received by the HTTP::Proxy object, it is filtered through
-a standard filter that transform this request accordingly to RFC 2616
-(by adding the Via: header, and a few other transformations).
-
-The response is also filtered in the same manner. There is a total of four
-filter chains: C<request-headers>, C<request-body>, C<reponse-headers> and
-C<response-body>.
-
-=head2 push_filter()
-
-You can add your own filters to the default ones with the
-push_filter() method. The method push a filter on the appropriate
-filter stack.
-
-    $proxy->push_filter( response => $filter );
-
-The headers/body category is determined by the type of the filter.
-There are two base classes for filters, which are
-HTTP::Proxy::HeaderFilter and HTTP::Proxy::BodyFilter (the names
-are self-explanatory). See the documentation of those two classes
-to find out how to write your own header or body filters.
-
-The named parameter is used to determine the request/response part.
-
-It is possible to push the same filter on the request and response
-stacks, as in the following example:
-
-    $proxy->push_filter( request => $filter, response => $filter );
-
-If several filters match the message, they will be applied in the order
-they were pushed on their filter stack.
-
-Named parameters can be used to create the match routine. They are: 
-
-    mime   - the MIME type (for a response-body filter)
-    method - the request method
-    scheme - the URI scheme         
-    host   - the URI authority (host:port)
-    path   - the URI path
-    query  - the URI query string
-
-The filters are applied only when all the the parameters match the
-request or the response. All these named parameters have default values,
-which are:
-
-    mime   => 'text/*'
-    method => 'OPTIONS,GET,HEAD,POST,PUT,DELETE,TRACE,CONNECT'
-    scheme => 'http'
-    host   => ''
-    path   => ''
-    query  => ''
-
-The C<mime> parameter is a glob-like string, with a required C</>
-character and a C<*> as a joker. Thus, C<*/*> matches I<all> responses,
-and C<""> those with no C<Content-Type:> header. To match any
-reponse (with or without a C<Content-Type:> header), use C<undef>.
-
-The C<mime> parameter is only meaningful with the C<response-body>
-filter stack. It is ignored if passed to any other filter stack.
-
-The C<method> and C<scheme> parameters are strings consisting of
-comma-separated values. The C<host> and C<path> parameters are regular
-expressions.
-
-A match routine is compiled by the proxy and used to check if a particular
-request or response must be filtered through a particular filter.
-
-It is also possible to push several filters on the same stack with
-the same match subroutine:
-
-    # convert italics to bold
-    $proxy->push_filter(
-        mime     => 'text/html',
-        response => HTTP::Proxy::BodyFilter::tags->new(),
-        response =>
-        HTTP::Proxy::BodyFilter::simple->new( sub { s!(</?)i>!$1b>!ig } )
-    );
-
-For more details regarding the creation of new filters, check the
-HTTP::Proxy::HeaderFilter and HTTP::Proxy::BodyFilter documentation.
-
-Here's an example of subclassing a base filter class:
-
-    # fixes a common typo ;-)
-    # but chances are that this will modify a correct URL
-    {
-        package FilterPerl;
-        use base qw( HTTP::Proxy::BodyFilter );
-
-        sub filter {
-            my ( $self, $dataref, $message, $protocol, $buffer ) = @_;
-            $$dataref =~ s/PERL/Perl/g;
-        }
-    }
-    $proxy->push_filter( response => FilterPerl->new() );
-
-Other examples can be found in the documentation for
-HTTP::Proxy::HeaderFilter, HTTP::Proxy::BodyFilter,
-HTTP::Proxy::HeaderFilter::simple, HTTP::Proxy::BodyFilter::simple.
-
-    # a simple anonymiser
-    # see eg/anonymiser.pl for the complete code
-    $proxy->push_filter(
-        mime    => undef,
-        request => HTTP::Proxy::HeaderFilter::simple->new(
-            sub { $_[0]->remove_header(qw( User-Agent From Referer Cookie )) },
-        ),
-        response => HTTP::Proxy::HeaderFilter::simple->new(
-            sub { $_[0]->remove_header(qw( Set-Cookie )); },
-        )
-    );
-
-IMPORTANT: If you use your own LWP::UserAgent, you must install it
-before your calls to push_filter(), otherwise
-the match method will make wrong assumptions about the schemes your
-agent supports.
-
 =head2 Other methods
 
 =over 4
 
 =item log( $level, $prefix, $message )
 
-Adds $message at the end of C<logfh>, if $level matches C<logmask>.
-The log() method also prints a timestamp.
+Adds C<$message> at the end of C<logfh>, if $level matches C<logmask>.
+The C<log()> method also prints a timestamp.
 
 The output looks like:
 
     [Thu Dec  5 12:30:12 2002] ($$) $prefix: $message
 
-where $$ is the current processus pid.
+where C<$$> is the current processus id.
 
-If $message is a multiline string, several log lines will be output,
+If C<$message> is a multiline string, several log lines will be output,
 each line starting with C<$prefix>.
+
+=item is_protocol_supported( $scheme )
+
+Returns a boolean indicating if $scheme is supported by the proxy.
+
+This method is only used internaly.
+
+It is essential to allow HTTP::Proxy users to create "pseudo-schemes"
+that LWP doesn't know about, but that one of the proxy filters can handle
+directly. New schemes are added as follows:
+
+    $proxy->init();    # required to get an agent
+    $proxy->agent->protocols_allowed(
+        [ @{ $proxy->agent->protocols_allowed }, 'myhttp' ] );
+
+=item new_connection()
+
+Increase the proxy's TCP connections counter. Only used by
+C<HTTP::Proxy::Engine> objects.
+
+=back
+
+=head2 Apache-like attributes
+
+C<HTTP::Proxy> has several Apache-like attributes that control the
+way the HTTP and TCP connections are handled.
+
+The following attributes control the TCP connection. They are passed to
+the underlying C<HTTP::Proxy::Engine>, which may (or may not) use them
+to change its behaviour.
+
+=over 4
+
+=item start_servers
+
+Number of child process to fork at the beginning.
+
+=item max_clients
+
+Maximum number of concurrent TCP connections (i.e. child processes).
+
+=item max_requests_per_child
+
+Maximum number of TCP connections handled by the smae child process.
+
+=item min_spare_servers
+
+Minimum number of inactive child processes.
+
+=item max_spare_servers
+
+Maximum number of inactive child processes.
+
+=back
+
+Those attributes control the HTTP connection:
+
+=over 4
+
+=item keep_alive
+
+Support for keep alive HTTP connections.
+
+=item max_keep_alive_requests
+
+Maximum number of HTTP connections within a single TCP connection.
+
+=item keep_alive_timeout
+
+Timeout for keep-alive connection.
 
 =back
 
@@ -1229,8 +1369,7 @@ This module does not work under Windows, but I can't see why, and do not
 have a development platform under that system. Patches and explanations
 very welcome.
 
-I guess it is because fork() is not well supported. You can try to use
-the following workaround to prevent forking:
+I guess it is because C<fork()> is not well supported.
 
     $proxy->maxchild(0);
 
@@ -1243,30 +1382,42 @@ work on WinXP ActiveState Perl 5.8.
 
 =back
 
+Several people have tried to help, but we haven't found a way to make it work
+correctly yet.
+
+As from version 0.16, the default engine is C<HTTP::Proxy::Engine::NoFork>.
+Let me know if it works better.
+
 =head1 SEE ALSO
 
-L<HTTP::Proxy::BodyFilter>, L<HTTP::Proxy::HeaderFilter>, the examples in eg/.
+L<HTTP::Proxy::Engine>, L<HTTP::Proxy::BodyFilter>,
+L<HTTP::Proxy::HeaderFilter>, the examples in F<eg/>.
 
 =head1 AUTHOR
 
 Philippe "BooK" Bruhat, E<lt>book@cpan.orgE<gt>.
 
-The module has its own web page at http://http-proxy.mongueurs.net/
+The module has its own web page at L<http://http-proxy.mongueurs.net/>
 complete with older versions and repository snapshot.
 
 There are also two mailing-lists: http-proxy@mongueurs.net for general
-discussion about HTTP::Proxy and http-proxy-cvs@mongueurs.net for
-CVS commits.
+discussion about C<HTTP::Proxy> and http-proxy-cvs@mongueurs.net for
+CVS commits emails.
 
 =head1 THANKS
 
 Many people helped me during the development of this module, either on
-mailing-lists, irc or over a beer in a pub...
+mailing-lists, IRC or over a beer in a pub...
 
-So, in no particular order, thanks to the libwww-perl team for such
-a terrific suite of modules, Michael Schwern (tips for testing while
-forking), the Paris.pm folks (forking processes, chunked encoding)
-and my growing user base... C<;-)>
+So, in no particular order, thanks to the libwww-perl team for such a
+terrific suite of modules, perl-qa (tips for testing), the French Perl
+I<Mongueurs> (for code tricks, beers and encouragements) and my growing
+user base... C<;-)>
+
+I'd like to particularly thank Dan Grigsby, who's been using
+C<HTTP::Proxy> since 2003 (before the filter classes even existed).  He is
+apparently making a living from a product based on C<HTTP::Proxy>. Thanks
+a lot for your confidence in my work!
 
 =head1 COPYRIGHT
 
@@ -1278,4 +1429,5 @@ This module is free software; you can redistribute it or modify it under
 the same terms as Perl itself.
 
 =cut
+
 

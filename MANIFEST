@@ -6,6 +6,7 @@ eg/ayb.pl
 eg/bork.pl
 eg/dragon.pl
 eg/fudd.pl
+eg/https.pl
 eg/javascript.pl
 eg/js.pl
 eg/leet.pl
@@ -22,6 +23,7 @@ eg/rot13.pl
 eg/switch.pl
 eg/tracker.pl
 eg/trim.pl
+eg/yahoogroups.pl
 lib/HTTP/Proxy.pm
 lib/HTTP/Proxy/BodyFilter.pm
 lib/HTTP/Proxy/BodyFilter/complete.pm
@@ -31,6 +33,9 @@ lib/HTTP/Proxy/BodyFilter/lines.pm
 lib/HTTP/Proxy/BodyFilter/save.pm
 lib/HTTP/Proxy/BodyFilter/simple.pm
 lib/HTTP/Proxy/BodyFilter/tags.pm
+lib/HTTP/Proxy/Engine.pm
+lib/HTTP/Proxy/Engine/Legacy.pm
+lib/HTTP/Proxy/Engine/NoFork.pm
 lib/HTTP/Proxy/HeaderFilter.pm
 lib/HTTP/Proxy/HeaderFilter/simple.pm
 lib/HTTP/Proxy/HeaderFilter/standard.pm
@@ -44,7 +49,10 @@ t/02pod-coverage.t
 t/05new.t
 t/10init.t
 t/15accessors.t
+t/15deprecated.t
+t/16stash.t
 t/17fstack.t
+t/18engine.t
 t/20dummy.t
 t/20keepalive.t
 t/22http.t
