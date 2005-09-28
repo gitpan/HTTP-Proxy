@@ -20,7 +20,7 @@ require Exporter;
 @EXPORT_OK = qw( NONE ERROR STATUS PROCESS SOCKET HEADERS FILTERS CONNECT ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = '0.16';
+$VERSION = '0.17';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
 
@@ -38,7 +38,8 @@ use constant HEADERS => 16;    # HTTP headers
 use constant FILTERS => 32;    # Messages from filters
 use constant DATA    => 64;    # Data received by the filters
 use constant CONNECT => 128;   # Data transmitted by the CONNECT method
-use constant ALL     => 255;   # All of the above
+use constant ENGINE  => 256;   # Internal information from the Engine
+use constant ALL     => 511;   # All of the above
 
 # Methods we can forward
 @METHODS = (
@@ -178,7 +179,7 @@ sub start {
     my $self = shift;
 
     $self->init;
-    $SIG{INT} = $SIG{KILL} = sub { $self->{loop} = 0 };
+    $SIG{INT} = $SIG{TERM} = sub { $self->{loop} = 0 };
 
     # the main loop
     my $engine = $self->engine;
@@ -270,7 +271,13 @@ sub serve_connections {
                       . ":" . $conn->peerport );
 
     my ( $last, $served ) = ( 0, 0 );
-    while ( my $req = $conn->get_request() ) {
+
+    while ( $self->loop() ) {
+        my $req;
+        {
+            local $SIG{INT} = local $SIG{TERM} = 'DEFAULT';
+            $req = $conn->get_request();
+        }
 
         $served++;
 
@@ -1328,7 +1335,7 @@ Maximum number of concurrent TCP connections (i.e. child processes).
 
 =item max_requests_per_child
 
-Maximum number of TCP connections handled by the smae child process.
+Maximum number of TCP connections handled by the same child process.
 
 =item min_spare_servers
 
