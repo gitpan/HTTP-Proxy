@@ -1,8 +1,8 @@
 ---
 name: HTTP-Proxy
-version: 0.17
+version: 0.18
 author:
-  - Philippe "BooK" Bruhat <book@cpan.org>
+  - 'Philippe "BooK" Bruhat <book@cpan.org>'
 abstract: A pure Perl HTTP proxy
 license: perl
 requires:
@@ -12,7 +12,7 @@ requires:
 provides:
   HTTP::Proxy:
     file: lib/HTTP/Proxy.pm
-    version: 0.17
+    version: 0.18
   HTTP::Proxy::BodyFilter:
     file: lib/HTTP/Proxy/BodyFilter.pm
   HTTP::Proxy::BodyFilter::complete:
@@ -39,7 +39,7 @@ provides:
     file: lib/HTTP/Proxy/Engine/ScoreBoard.pm
   HTTP::Proxy::FilterStack:
     file: lib/HTTP/Proxy.pm
-    version: 0.17
+    version: 0.18
   HTTP::Proxy::HeaderFilter:
     file: lib/HTTP/Proxy/HeaderFilter.pm
   HTTP::Proxy::HeaderFilter::simple:
