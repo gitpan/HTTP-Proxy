@@ -35,7 +35,7 @@ sub init {
     croak "status must contain only HTTP codes"
       if grep { !/^[12345]\d\d$/ } @{ $args{status} };
     croak "filename must be a code reference"
-      if defined $args{filename} && UNIVERSAL::isa($args{filename}, 'CODE');
+      if defined $args{filename} && !UNIVERSAL::isa( $args{filename}, 'CODE' );
 
     $self->{"_hpbf_save_$_"} = $args{$_}
       for qw( template no_host no_dirs cut_dirs prefix
@@ -196,6 +196,9 @@ as it flows through the proxy. Depending on where the filter is located
 in the stack, the saved data can be more or less modified.
 
 This filter I<will> create directories if it needs to!
+
+I<Note:> Remember that the default C<mime> parameter for C<push_filter()>
+is C<text/*> and that you may need to change it for other MIME types.
 
 =head2 Constructor
 
@@ -395,6 +398,9 @@ irc while coding the nasty C<begin()> method. C<;-)>
 Thanks to Howard Jones for the inspiration and initial patch for the
 C<filename> option. Lucas Gonze provided a patch to make C<status>
 actually work.
+
+Thanks to Max Maischein for detecting a bug in the paramerter validation
+for C<filename>.
 
 =head1 COPYRIGHT
 

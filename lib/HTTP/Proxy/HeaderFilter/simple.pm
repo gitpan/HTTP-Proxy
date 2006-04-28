@@ -6,7 +6,7 @@ use HTTP::Proxy::HeaderFilter;
 use vars qw( @ISA );
 @ISA = qw( HTTP::Proxy::HeaderFilter );
 
-my $methods = join '|', qw( begin filter );
+my $methods = join '|', qw( begin filter end );
 $methods = qr/^(?:$methods)$/;
 
 sub init {
@@ -19,6 +19,7 @@ sub init {
         $self->{_filter} = $_[0];
     }
     else {
+        $self->{_filter} = sub { };    # default
         while (@_) {
             my ( $name, $code ) = splice @_, 0, 2;
 
@@ -35,6 +36,7 @@ sub init {
 # transparently call the actual methods
 sub begin       { goto &{ $_[0]{_begin} }; }
 sub filter      { goto &{ $_[0]{_filter} }; }
+sub end         { goto &{ $_[0]{_end} }; }
 
 sub can {
     my ( $self, $method ) = @_;
@@ -89,6 +91,8 @@ passed to the constructor. These "proxy" methods are:
 =item filter()
 
 =item begin()
+
+=item end()
 
 =back
 
