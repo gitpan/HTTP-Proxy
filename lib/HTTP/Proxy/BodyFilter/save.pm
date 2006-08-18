@@ -157,6 +157,8 @@ sub end {
     }
 }
 
+sub will_modify { 0 }
+
 1;
 
 __END__
@@ -372,6 +374,11 @@ Save all the data that goes through to the opened file.
 
 Close the file when the whole message body has been processed.
 
+=item will_modify()
+
+This method returns a I<false> value, thus indicating to the system
+that it will not modify data passing through.
+
 =back
 
 =head1 SEE ALSO
@@ -404,7 +411,7 @@ for C<filename>.
 
 =head1 COPYRIGHT
 
-Copyright 2004-2005, Philippe Bruhat.
+Copyright 2004-2006, Philippe Bruhat.
 
 =head1 LICENSE
 
