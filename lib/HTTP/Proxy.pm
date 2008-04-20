@@ -20,7 +20,7 @@ require Exporter;
                  DATA  CONNECT ENGINE ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = '0.20';
+$VERSION = '0.21';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
 
@@ -856,8 +856,9 @@ the same match subroutine:
     $proxy->push_filter(
         mime     => 'text/html',
         response => HTTP::Proxy::BodyFilter::tags->new(),
-        response =>
-          HTTP::Proxy::BodyFilter::simple->new( sub { s!(</?)i>!$1b>!ig } )
+        response => HTTP::Proxy::BodyFilter::simple->new(
+            sub { ${ $_[1] } =~ s!(</?)i>!$1b>!ig }
+        )
     );
 
 For more details regarding the creation of new filters, check the
