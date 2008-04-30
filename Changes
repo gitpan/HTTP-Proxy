@@ -1,5 +1,15 @@
 Revision history for Perl extension HTTP::Proxy
 
+0.22 Thu May  1 00:18:38 CEST 2008
+        [TESTS]
+        - increased test coverage
+        - t/23connect.t doesn't need an Internet connection any more,
+          thus closing RT ticket #19653.
+        - t/67complete.t tests HTTP::Proxy::BodyFilter::complete
+        [DOCUMENTATION]
+        - closed RT ticket #33465 (Jimbo), by explaining in a little
+          more detail how HTTP::Proxy::BodyFilter::complete works.
+
 0.21 Sun Apr 20 04:34:47 CEST 2008
         [ENHANCEMENTS]
         - HTTP::Proxy::Engine::Legacy and HTTP::Proxy::Engine::ScoreBoard
@@ -17,6 +27,8 @@ Revision history for Perl extension HTTP::Proxy
         [TESTS]
         - t/67save.t provides 96% coverage of HTTP::Proxy::BodyFilter::save,
           and helped fix many bugs in it.
+        - fixed t/22http.t and t/22transparent.t not to break when the
+          DNS wrongly resolves an invalid address.
         [DOCUMENTATION]
         - closed RT ticket #25295 (Matsuno Tokuhiro) with a doc patch.
 
