@@ -7,6 +7,9 @@ use IO::Socket::INET;
 plan skip_all => "This test fails on MSWin32. HTTP::Proxy is usable on Win32 with maxchild => 0"
   if $^O eq 'MSWin32';
 
+# make sure we inherit no upstream proxy
+delete $ENV{$_} for qw( http_proxy HTTP_PROXY );
+
 # test CONNECT
 my $test = Test::Builder->new;
 
@@ -28,6 +31,7 @@ my $banner = "President_of_Earth Barbarella Professor_Ping Stomoxys Dildano\n";
     if ( !$pid ) {
         my $sock = $server->accept;
         $sock->print($banner);
+        sleep 1;
         $sock->close;
         exit;
     }
@@ -49,7 +53,7 @@ plan tests => 4;
     );
 
     # wait for the server and proxy to be ready
-    sleep 4;
+    sleep 2;
 
     # run a client
     my $ua = LWP::UserAgent->new;
@@ -60,9 +64,18 @@ plan tests => 4;
     my $sock = $res->{client_socket};
 
 
-    my $read;
+    # what does the proxy say?
     is( $res->code, 200, "The proxy accepts CONNECT requests" );
-    ok( $sock->sysread( $read, 100 ), "Read some data from the socket" );
+
+    # read a line
+    my $read;
+    eval {
+        local $SIG{ALRM} = sub { die 'timeout' };
+        alarm 30;
+        $read = <$sock>;
+    };
+    
+    ok( $read, "Read some data from the socket" );
     is( $read, $banner, "CONNECTed to the TCP server and got the banner" );
     close $sock;
 

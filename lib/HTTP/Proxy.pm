@@ -20,7 +20,7 @@ require Exporter;
                  DATA  CONNECT ENGINE ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = '0.22';
+$VERSION = '0.23';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
 
@@ -553,13 +553,48 @@ sub _handle_CONNECT {
 
     my $conn = $self->client_socket;
     my $req  = $self->request;
-    my $upstream = IO::Socket::INET->new( PeerAddr => $req->uri->host_port );
-    unless( $upstream and $upstream->connected ) {
-        # 502 Bad Gateway / 504 Gateway Timeout
-        # Note to implementors: some deployed proxies are known to
-        # return 400 or 500 when DNS lookups time out.
-        my $response = HTTP::Response->new( 200 );
+    my $upstream;
+
+    # connect upstream
+    if ( my $up = $self->agent->proxy('http') ) {
+
+        # clean up authentication info from proxy URL
+        $up =~ s{^http://[^/\@]*\@}{http://};
+
+        # forward to upstream proxy
+        $self->log( PROXY, "PROXY",
+            "Forwarding CONNECT request to next proxy: $up" );
+        my $response = $self->agent->simple_request($req);
+
+        # check the upstream proxy's response
+        my $code = $response->code;
+        if ( $code == 407 ) {    # don't forward Proxy Authentication requests
+            my $response_407 = $response->as_string;
+            $response_407 =~ s/^Client-.*$//mg;
+            $response = HTTP::Response->new(502);
+            $response->content_type("text/plain");
+            $response->content( "Upstream proxy ($up) "
+                    . "requested authentication:\n\n"
+                    . $response_407 );
+            $self->response($response);
+            return $last;
+        }
+        elsif ( $code != 200 ) {    # forward every other failure
+            $self->response($response);
+            return $last;
+        }
+
+        $upstream = $response->{client_socket};
+    }
+    else {                                  # direct connection
+        $upstream = IO::Socket::INET->new( PeerAddr => $req->uri->host_port );
+    }
+
+    # no upstream socket obtained
+    if( !$upstream ) {
+        my $response = HTTP::Response->new( 500 );
         $response->content_type( "text/plain" );
+        $response->content( "CONNECT failed: $@");
         $self->response($response);
         return $last;
     }

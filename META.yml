@@ -1,10 +1,12 @@
 ---
 name: HTTP-Proxy
-version: 0.22
+version: 0.23
 author:
   - 'Philippe "BooK" Bruhat <book@cpan.org>'
 abstract: A pure Perl HTTP proxy
 license: perl
+resources:
+  license: http://dev.perl.org/licenses/
 requires:
   HTTP::Daemon: 1.25
   LWP::UserAgent: 2
@@ -12,7 +14,7 @@ requires:
 provides:
   HTTP::Proxy:
     file: lib/HTTP/Proxy.pm
-    version: 0.22
+    version: 0.23
   HTTP::Proxy::BodyFilter:
     file: lib/HTTP/Proxy/BodyFilter.pm
   HTTP::Proxy::BodyFilter::complete:
@@ -45,4 +47,7 @@ provides:
     file: lib/HTTP/Proxy/HeaderFilter/simple.pm
   HTTP::Proxy::HeaderFilter::standard:
     file: lib/HTTP/Proxy/HeaderFilter/standard.pm
-generated_by: Module::Build version 0.26
+generated_by: Module::Build version 0.2808
+meta-spec:
+  url: http://module-build.sourceforge.net/META-spec-v1.2.html
+  version: 1.2
