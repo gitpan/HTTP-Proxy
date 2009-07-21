@@ -20,7 +20,7 @@ require Exporter;
                  DATA  CONNECT ENGINE ALL );
 %EXPORT_TAGS = ( log => [@EXPORT_OK] );    # only one tag
 
-$VERSION = '0.23';
+$VERSION = '0.24';
 
 my $CRLF = "\015\012";                     # "\r\n" is not portable
 
@@ -464,8 +464,6 @@ sub serve_connections {
         # (empty body or error)
         # FIXME some error response headers might not be filtered
         if ( !$sent ) {
-            $self->{$_}{response}->select_filters( $response )
-              for qw( headers body );
             ($last, $chunked) = $self->_send_response_headers( $served );
             my $content = $response->content;
             if ($chunked) {

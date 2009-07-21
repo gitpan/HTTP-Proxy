@@ -1,6 +1,6 @@
 ---
 name: HTTP-Proxy
-version: 0.23
+version: 0.24
 author:
   - 'Philippe "BooK" Bruhat <book@cpan.org>'
 abstract: A pure Perl HTTP proxy
@@ -14,7 +14,7 @@ requires:
 provides:
   HTTP::Proxy:
     file: lib/HTTP/Proxy.pm
-    version: 0.23
+    version: 0.24
   HTTP::Proxy::BodyFilter:
     file: lib/HTTP/Proxy/BodyFilter.pm
   HTTP::Proxy::BodyFilter::complete:
@@ -47,7 +47,7 @@ provides:
     file: lib/HTTP/Proxy/HeaderFilter/simple.pm
   HTTP::Proxy::HeaderFilter::standard:
     file: lib/HTTP/Proxy/HeaderFilter/standard.pm
-generated_by: Module::Build version 0.2808
+generated_by: Module::Build version 0.280801
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.2.html
   version: 1.2
