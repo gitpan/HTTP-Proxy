@@ -34,7 +34,7 @@ sub run {
 
         # accept the new connection
         my $conn  = $fh->accept;
-	my $child=threads->new(\&worker,$proxy,$conn);
+	my $child=threads->new(\&_worker,$proxy,$conn);
         if ( !defined $child ) {
             $conn->close;
             $proxy->log( HTTP::Proxy::ERROR, "PROCESS", "Cannot spawn thread" );
@@ -53,7 +53,7 @@ sub stop {
    # not needed
 }
 
-sub worker {
+sub _worker {
 	my $proxy=shift;
 	my $conn=shift;
        $proxy->serve_connections($conn);
@@ -75,11 +75,11 @@ HTTP::Proxy::Engine::Threaded - A scoreboard-based HTTP::Proxy engine
 
 =head1 DESCRIPTION
 
-This module provides a threaded engine to HTTP::Proxy.
+This module provides a threaded engine to L<HTTP::Proxy>.
 
 =head1 METHODS
 
-The module defines the following methods, used by HTTP::Proxy main loop:
+The module defines the following methods, used by L<HTTP::Proxy> main loop:
 
 =over 4
 
@@ -110,7 +110,7 @@ Philippe "BooK" Bruhat, C<< <book@cpan.org> >>. (Documentation)
 
 =head1 COPYRIGHT
 
-Copyright 2010, Philippe Bruhat.
+Copyright 2010-2013, Philippe Bruhat.
 
 =head1 LICENSE
 

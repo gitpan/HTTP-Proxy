@@ -32,7 +32,8 @@ sub filter {
         $$dataref =~ /\G(?=(<[^\s\/?%!a-z]))/cgi && goto TEXT;  # < in text
         $$dataref =~ /\G(?:<[^>]*>)+/cg          && redo SCAN;  # tags
         $$dataref =~ /\G(?:&[^\s;]*;?)+/cg       && redo SCAN;  # entities
-        $$dataref =~ /\G([^<>&]+)/cg             && do {        # text
+        $$dataref =~ /\G([^<>&]+)/cg             && goto TEXT;  # text
+        last SCAN;
           TEXT:
             redo SCAN if $self->{js};    # ignore protected
             {
@@ -42,7 +43,6 @@ sub filter {
                 pos($$dataref) = $pos + length($_);
             }
             redo SCAN;
-        };
     }
 }
 
@@ -70,7 +70,7 @@ HTTP::Proxy::BodyFilter::htmltext - A filter to transmogrify HTML text
 
 =head1 DESCRIPTION
 
-The HTTP::Proxy::BodyFilter::htmltext is a filter spawner that
+The L<HTTP::Proxy::BodyFilter::htmltext> is a filter spawner that
 calls the callback of your choice on any HTML text (outside 
 C<< <script> >> and C<< <style> >> tags, and entities).
 
@@ -110,7 +110,7 @@ Philippe "BooK" Bruhat, E<lt>book@cpan.orgE<gt>.
 
 =head1 COPYRIGHT
 
-Copyright 2003-2005, Philippe Bruhat.
+Copyright 2003-2013, Philippe Bruhat.
 
 =head1 LICENSE
 
