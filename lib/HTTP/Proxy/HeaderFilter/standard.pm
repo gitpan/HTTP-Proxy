@@ -90,7 +90,7 @@ sub filter {
     # no encoding accepted (gzip, compress, deflate)
     # if we plan to do anything with the response body
     $headers->remove_header( 'Accept-Encoding' )
-        if @{ $self->proxy->{body}{response}{current} || [] };
+        if @{ $self->proxy->{body}{response}{filters} };
 }
 
 1;
@@ -118,6 +118,10 @@ Enforce RFC 2616-compliant behaviour, by adding the C<Via:> and
 C<X-Forwarded-For:> headers (except when the proxy was instructed not
 to add them), decrementing the C<Max-Forwards:> header and removing
 the hop-by-hop and L<LWP::UserAgent> headers.
+
+Note that the filter will automatically remove the C<Accept-Encoding>
+headers if the proxy has at least one L<HTTP::Proxy::BodyFilter> filter.
+(This is to ensure that the filters will receive uncompressed data.)
 
 =back
 

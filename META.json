@@ -30,7 +30,7 @@
    "provides" : {
       "HTTP::Proxy" : {
          "file" : "lib/HTTP/Proxy.pm",
-         "version" : "0.27"
+         "version" : "0.28"
       },
       "HTTP::Proxy::BodyFilter" : {
          "file" : "lib/HTTP/Proxy/BodyFilter.pm",
@@ -110,5 +110,5 @@
          "url" : "http://github.com/book/HTTP-Proxy"
       }
    },
-   "version" : "0.27"
+   "version" : "0.28"
 }
