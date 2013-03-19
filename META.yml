@@ -15,7 +15,7 @@ name: HTTP-Proxy
 provides:
   HTTP::Proxy:
     file: lib/HTTP/Proxy.pm
-    version: 0.28
+    version: 0.29
   HTTP::Proxy::BodyFilter:
     file: lib/HTTP/Proxy/BodyFilter.pm
     version: 0
@@ -74,4 +74,4 @@ requires:
 resources:
   license: http://dev.perl.org/licenses/
   repository: http://github.com/book/HTTP-Proxy
-version: 0.28
+version: 0.29
