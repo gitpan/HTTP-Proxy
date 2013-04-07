@@ -22,15 +22,14 @@
       "runtime" : {
          "requires" : {
             "HTTP::Daemon" : "1.25",
-            "LWP::UserAgent" : "2",
-            "Test::More" : "0"
+            "LWP::UserAgent" : "2"
          }
       }
    },
    "provides" : {
       "HTTP::Proxy" : {
          "file" : "lib/HTTP/Proxy.pm",
-         "version" : "0.29"
+         "version" : "0.300"
       },
       "HTTP::Proxy::BodyFilter" : {
          "file" : "lib/HTTP/Proxy/BodyFilter.pm",
@@ -110,5 +109,5 @@
          "url" : "http://github.com/book/HTTP-Proxy"
       }
    },
-   "version" : "0.29"
+   "version" : "0.300"
 }
